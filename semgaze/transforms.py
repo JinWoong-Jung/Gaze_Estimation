@@ -10,6 +10,7 @@ import math
 import torch
 import torchvision.transforms.functional as TF
 
+from PIL import Image # Added import
 from semgaze.utils.common import get_img_size, pair
 
 
@@ -58,11 +59,13 @@ class Resize(object):
     def __call__(self, sample):
         num_heads = len(sample["heads"])
 
-        # Resize Image
-        sample["image"] = TF.resize(sample["image"], self.img_size, antialias=True)  # type: ignore
+        # Resize Image (only if it's a PIL Image, not a feature tensor)
+        if isinstance(sample["image"], Image.Image):
+            sample["image"] = TF.resize(sample["image"], self.img_size, antialias=True)  # type: ignore
         
         # Resize Heads
         for k in range(num_heads):
+            # Heads are always PIL Images initially
             sample["heads"][k] = TF.resize(sample["heads"][k], self.head_size, antialias=True)
 
         return sample
@@ -80,8 +83,9 @@ class RandomHorizontalFlip(object):
         if torch.rand(1) <= self.p:
             num_heads = len(sample["heads"])
 
-            # Flip Image
-            sample["image"] = TF.hflip(sample["image"])  # type: ignore
+            # Flip Image (only if it's a PIL Image)
+            if isinstance(sample["image"], Image.Image):
+                sample["image"] = TF.hflip(sample["image"])  # type: ignore
 
             # Flip Heads
             for k in range(num_heads):
@@ -127,22 +131,26 @@ class ColorJitter(object):
             fn_indices = torch.randperm(4)
             for fn_id in fn_indices:
                 if fn_id == 0 and brightness_factor is not None:
-                    sample["image"] = TF.adjust_brightness(sample["image"], brightness_factor)
+                    if isinstance(sample["image"], Image.Image): # Conditional application
+                        sample["image"] = TF.adjust_brightness(sample["image"], brightness_factor)
                     for k in range(num_heads):
                         sample["heads"][k] = TF.adjust_brightness(sample["heads"][k], brightness_factor)
 
                 elif fn_id == 1 and contrast_factor is not None:
-                    sample["image"] = TF.adjust_contrast(sample["image"], contrast_factor)
+                    if isinstance(sample["image"], Image.Image): # Conditional application
+                        sample["image"] = TF.adjust_contrast(sample["image"], contrast_factor)
                     for k in range(num_heads):
                         sample["heads"][k] = TF.adjust_contrast(sample["heads"][k], contrast_factor)
 
                 elif fn_id == 2 and saturation_factor is not None:
-                    sample["image"] = TF.adjust_saturation(sample["image"], saturation_factor)
+                    if isinstance(sample["image"], Image.Image): # Conditional application
+                        sample["image"] = TF.adjust_saturation(sample["image"], saturation_factor)
                     for k in range(num_heads):
                         sample["heads"][k] = TF.adjust_saturation(sample["heads"][k], saturation_factor)
 
                 elif fn_id == 3 and hue_factor is not None:
-                    sample["image"] = TF.adjust_hue(sample["image"], hue_factor)
+                    if isinstance(sample["image"], Image.Image): # Conditional application
+                        sample["image"] = TF.adjust_hue(sample["image"], hue_factor)
                     for k in range(num_heads):
                         sample["heads"][k] = TF.adjust_hue(sample["heads"][k], hue_factor)
 
@@ -159,7 +167,10 @@ class Normalize(object):
         self.img_std = img_std
 
     def __call__(self, sample):
-        sample["image"] = TF.normalize(sample["image"], self.img_mean, self.img_std)
+        # Normalize Image (only if it's a multi-dimensional tensor, not a feature vector)
+        if isinstance(sample["image"], torch.Tensor) and sample["image"].ndim >= 3:
+            sample["image"] = TF.normalize(sample["image"], self.img_mean, self.img_std)
+        # Normalize Heads (they should be a stacked tensor at this point)
         sample["heads"] = TF.normalize(sample["heads"], self.img_mean, self.img_std)
         return sample
 
@@ -172,8 +183,9 @@ class ToTensor(object):
     def __call__(self, sample):
         num_heads = len(sample["heads"])
         
-        # Convert image
-        sample["image"] = TF.to_tensor(sample["image"])
+        # Convert image (only if it's a PIL Image)
+        if isinstance(sample["image"], Image.Image):
+            sample["image"] = TF.to_tensor(sample["image"])
 
         # Convert heads
         for k in range(num_heads):

@@ -11,10 +11,28 @@ from typing import Union
 
 
 @dataclass
-class Data:
+class GazeFollowData:
     root: str
+    root_annotations: str
+    root_heads: str
+    num_train_samples: int
+    vocab_size: int
+
+@dataclass
+class GazeHOIData:
+    root: str
+    num_train_samples: int
+    vocab_size: int
+
+@dataclass
+class Data:
+    num_people: int
+    image_size: int
     heatmap_size: int
     heatmap_sigma: int
+    return_head_mask: bool
+    gf: GazeFollowData
+    gazehoi: GazeHOIData
 
 
 @dataclass

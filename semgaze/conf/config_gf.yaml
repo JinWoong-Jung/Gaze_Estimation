@@ -15,12 +15,12 @@ project:
     name: semgaze # name of the wandb project
     version: 1.0.0
     description: SemGaze - Transformer encoder-decoder architecture for gaze target localization and recognition.
-    root: </path/to>/semgaze # FILL ME
+    root: /home/elicer/semgaze # FILL ME
 
 # ------------------------------------------------------------------------------------------------------------------- #
 
 experiment:
-    name: run-name # name of the wandb job
+    name: semgaze_DINOv3(vit-b/16) # name of the wandb job
     group: null # name of the wandb group
     task: train+test # combination of {train, val, test} separated by '+' sign
     dataset: gazefollow # gazefollow, gazehoi
@@ -30,17 +30,18 @@ experiment:
 
 data:
     num_people: 1 # int or -1 to include all people
-    image_size: 256
-    heatmap_size: 64
+    image_size: 256 # 224 -> 256
+    heatmap_size: 64 # 56 -> 64
     heatmap_sigma: 3
     return_head_mask: False
     gf:
-        root: </path/to>/gazefollow_extended # FILL ME
-        root_heads: </path/to>/GazeFollow-head # FILL ME (if needed)
+        root: /home/elicer/semgaze/data/gazefollow_extended # FILL ME
+        root_annotations: /home/elicer/semgaze/data/gazefollow_extended # FILL ME
+        root_heads: /home/elicer/semgaze/data/GazeFollow-head # FILL ME (if needed)
         num_train_samples: 108955
         vocab_size: 346
     gazehoi:
-        root: </path/to>/GazeHOI # FILL ME
+        root: /home/elicer/semgaze/data/gazehoi # FILL ME
         num_train_samples: 47044
         vocab_size: 463
 
@@ -53,15 +54,12 @@ model:
         token_dim: 768
         image_size: ${data.image_size}
         gaze_vec_dim: 2
-        encoder_depth: 12
-        encoder_num_heads: 12
-        encoder_num_global_tokens: 1
+        image_encoder_name: facebook/dinov3-vitb16-pretrain-lvd1689m
         decoder_depth: 2
         decoder_num_heads: 8
         temp_init_value: 0.07
     pretraining:
-        gaze_backbone: </path/to>/semgaze/weights/gaze360_resnet18.pt # FILL ME
-        image_encoder: </path/to>/semgaze/weights/multimae-b_98_rgb+-depth-semseg_1600e_multivit-afff3f8c.pth # FILL ME
+        gaze_backbone: /home/elicer/semgaze/weights/gaze360_resnet18.pt # FILL ME
     weights: null # /!\ null (default), or path to a checkpoint (overrides pretraining weights)
 
 # ------------------------------------------------------------------------------------------------------------------- #
@@ -101,7 +99,7 @@ train:
     freeze:
         gaze_encoder: False 
         image_tokenizer: False
-        image_encoder: False
+        image_encoder: True
         gaze_decoder: False
     swa:
         use: True
@@ -127,8 +125,8 @@ test:
 
 wandb:
     log: True
-    entity: null # /!\ null, or your wandb entity
-    watch: null # /!\ null, gradients, parameters, all
+    entity: semgaze # /!\ null, or your wandb entity
+    watch: all # /!\ null, gradients, parameters, all
     watch_freq: 500
 
 # ------------------------------------------------------------------------------------------------------------------- #

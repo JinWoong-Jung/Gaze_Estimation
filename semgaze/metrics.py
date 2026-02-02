@@ -55,7 +55,7 @@ class GFTestDistance(tm.Metric):
     def update(self, gaze_point_pred: torch.Tensor, gaze_point_gt: torch.Tensor):
         for k, (gp_pred, gp_gt) in enumerate(zip(gaze_point_pred, gaze_point_gt)):
             gp_gt = gp_gt[gp_gt[:, 0] != -1]  # discard invalid gaze points
-
+            
             # Compute average gaze point
             gp_gt_avg = gp_gt.mean(0)
             # Compute distance from pred to avg gt point

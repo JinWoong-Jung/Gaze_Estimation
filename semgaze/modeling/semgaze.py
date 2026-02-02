@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from transformers import get_cosine_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup, DINOv3ViTModel
 
 import torchmetrics as tm
 import pytorch_lightning as pl
@@ -48,12 +48,10 @@ class SemGazeModule(pl.LightningModule):
             patch_size=cfg.model.semgaze.patch_size, 
             token_dim=cfg.model.semgaze.token_dim, 
             gaze_vec_dim=cfg.model.semgaze.gaze_vec_dim, 
-            encoder_num_heads=cfg.model.semgaze.encoder_num_heads, 
-            encoder_depth=cfg.model.semgaze.encoder_depth, 
-            encoder_num_global_tokens=cfg.model.semgaze.encoder_num_global_tokens, 
+            image_encoder_name=cfg.model.semgaze.image_encoder_name,
             decoder_depth=cfg.model.semgaze.decoder_depth, 
             decoder_num_heads=cfg.model.semgaze.decoder_num_heads, 
-            decoder_label_emb_dim=512,   
+            decoder_label_emb_dim=512,
         )
 
         self.cfg = cfg
@@ -100,29 +98,6 @@ class SemGazeModule(pl.LightningModule):
             print(colored(f"Loaded the model pre-trained weights from {self.cfg.model.weights}.", TERM_COLOR))
             del model_ckpt
         else:
-            # Load ViT weights for Image Encoder (from MultiMAE)
-            vit_ckpt = torch.load(self.cfg.model.pretraining.image_encoder, map_location="cpu")
-            
-            vit_tokenizer_weights = OrderedDict([
-                (name.replace("input_adapters.rgb.", ""), value) 
-                for name, value in vit_ckpt["model"].items() 
-                if "input_adapters.rgb" in name
-            ])
-            vit_tokenizer_weights["pos_emb"] = F.interpolate(
-                vit_tokenizer_weights["pos_emb"], 
-                size=(self.feature_map_size, self.feature_map_size), 
-                mode="bilinear"
-            )
-            vit_encoder_weights = OrderedDict([
-                (name.replace("encoder.", ""), value) 
-                for name, value in vit_ckpt["model"].items() 
-                if "encoder" in name
-            ])
-            
-            self.model.image_tokenizer.load_state_dict(vit_tokenizer_weights, strict=True)
-            self.model.encoder.encoder.load_state_dict(vit_encoder_weights, strict=True)
-            print(colored(f"Loaded Image Encoder weights from {self.cfg.model.pretraining.image_encoder}.", TERM_COLOR))
-
             # Load Gaze360 Weights for Gaze Encoder Backbone
             gaze_backbone_ckpt = torch.load(self.cfg.model.pretraining.gaze_backbone, map_location="cpu")
             gaze_backbone_weights = OrderedDict([
@@ -134,7 +109,7 @@ class SemGazeModule(pl.LightningModule):
             print(colored(f"Loaded Gaze Backbone weights from {self.cfg.model.pretraining.gaze_backbone}.", TERM_COLOR))
 
             # Delete checkpoints
-            del vit_ckpt, vit_tokenizer_weights, vit_encoder_weights, gaze_backbone_ckpt, gaze_backbone_weights
+            del gaze_backbone_ckpt, gaze_backbone_weights
         
         # Freeze weights
         self.freeze()
@@ -410,9 +385,7 @@ class SemGaze(nn.Module):
         patch_size: int = 16,
         token_dim: int = 768,
         gaze_vec_dim: int = 2,
-        encoder_num_heads: int = 12,
-        encoder_depth: int = 12,
-        encoder_num_global_tokens: int = 1,
+        image_encoder_name: str = "facebook/dinov3-base",
         decoder_depth: int = 2,
         decoder_num_heads: int = 8,
         decoder_label_emb_dim: int = 512,
@@ -420,8 +393,7 @@ class SemGaze(nn.Module):
         super().__init__()
         
         self.image_size = image_size
-        self.image_embedding_size = image_size // patch_size
-        self.encoder_num_global_tokens = encoder_num_global_tokens
+        self.patch_size = patch_size # Added this line
 
         self.gaze_encoder = GazeEncoder(
             token_dim=token_dim, 
@@ -429,27 +401,7 @@ class SemGaze(nn.Module):
             gaze_vec_dim=gaze_vec_dim
         )
 
-        self.image_tokenizer = SpatialInputTokenizer(
-            num_channels=3, 
-            stride_level=1, 
-            patch_size=patch_size, 
-            token_dim=token_dim, 
-            use_sincos_pos_emb=True, 
-            is_learnable_pos_emb=False, 
-            image_size=image_size
-        )
-
-        self.encoder = ViTEncoder(
-            token_dim=token_dim, 
-            depth=encoder_depth, 
-            num_heads=encoder_num_heads, 
-            num_global_tokens=encoder_num_global_tokens, 
-            mlp_ratio=4.0, 
-            use_qkv_bias=True, 
-            drop_rate=0.0, 
-            attn_drop_rate=0.0, 
-            drop_path_rate=0.0
-        )
+        self.encoder = DINOv3ViTModel.from_pretrained(image_encoder_name)
 
         self.gaze_decoder = GazeDecoder(
             token_dim=token_dim, 
@@ -465,15 +417,14 @@ class SemGaze(nn.Module):
         # Encode Gaze Tokens ===================================================
         gaze_tokens, gaze_vec = self.gaze_encoder(sample["heads"], sample["head_bboxes"])  # (b, n, d), (b, n, 2)
         
-        # Tokenize Inputs ===================================================
-        image_tokens = self.image_tokenizer(sample["image"])  # (b, t, d) / t = num_tokens, d = token_dim
+        # Encode Image =====================================================
+        image_tokens = self.encoder(sample["image"]).last_hidden_state  # (b, t+1, d)
+        image_tokens = image_tokens[:, (1 + self.encoder.config.num_register_tokens):, :] # (b, t, d), remove cls token and register tokens
         b, t, d = image_tokens.shape
-        s = int(math.sqrt(t))
         
-        # Encode Image =====================================================        
-        image_tokens = self.encoder(image_tokens, return_all_layers=False)  # (b, t+gt, d) / gt = num global tokens
-        image_tokens = image_tokens[:, :-self.encoder_num_global_tokens, :] # (b, t, d)
-        image_tokens = image_tokens.permute(0, 2, 1).view(b, d, s, s) # (b, t, d) >> (b, d, t) >> (b, d, s, s)
+        s = int(math.sqrt(t)) # This s should now be equal to s_spatial
+        
+        image_tokens = image_tokens.permute(0, 2, 1).view(b, d, s, s) # (b, d, t) >> (b, d, s, s)
         
         # Decode Gaze Target =====================================================
         gaze_heatmap, gaze_label_emb = self.gaze_decoder(image_tokens, gaze_tokens)  # (b, n, hm_h, hm_w), (b, n, 512)

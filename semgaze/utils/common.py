@@ -134,7 +134,12 @@ def get_img_size(image):
     if isinstance(image, Image.Image):
         img_w, img_h = image.size
     elif isinstance(image, torch.Tensor):
-        img_w, img_h = image.shape[2], image.shape[1]
+        if image.ndim == 3:
+            img_w, img_h = image.shape[2], image.shape[1]
+        elif image.ndim == 2:
+            img_w, img_h = image.shape[1], image.shape[0]
+        else:
+            raise Exception(f"Unsupported tensor dimensions: {image.ndim}")
     else:
         raise Exception(f"Input image needs to be either a Image.Image or torch.Tensor. Found {type(image)} instead.")
     return img_w, img_h

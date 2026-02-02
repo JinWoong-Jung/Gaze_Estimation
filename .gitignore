@@ -16,7 +16,6 @@ main.log
 semgaze-artifacts.tar.gz
 *.csv
 experiments/
-lightning_logs/
 logs/
 wandb/
 .hydra/

@@ -8,6 +8,7 @@
 
 import os
 import json
+import h5py
 from typing import Dict, Union
 
 import numpy as np
@@ -34,8 +35,8 @@ from semgaze.utils.common import pair, expand_bbox, generate_gaze_heatmap, gener
 
 
 
-IMG_MEAN = [0.44232, 0.40506, 0.36457]
-IMG_STD = [0.28674, 0.27776, 0.27995]
+IMG_MEAN = [0.485, 0.456, 0.406]
+IMG_STD = [0.229, 0.224, 0.225]
 
 # ============================================================================= #
 #                               GAZEFOLLOW DATASET                              #
@@ -131,7 +132,7 @@ class GazeFollowDataset(Dataset):
         return annotations.reset_index(drop=True)
 
     def __getitem__(self, index: int) -> Dict:
-        if self.split in ("train", "val"): 
+        if self.split in ("train", "val"):
             item = self.annotations.iloc[index]
             gaze_pt = torch.tensor([item["gaze_x"], item["gaze_y"]], dtype=torch.float)
             gaze_label = item["gaze_pseudo_label"]
@@ -144,49 +145,42 @@ class GazeFollowDataset(Dataset):
             p_annotations = self.annotations[self.annotations.path == image_path]
             gaze_pt = torch.from_numpy(p_annotations[["gaze_x", "gaze_y"]].values).float()
             p = 20 - len(gaze_pt)
-            gaze_pt = F.pad(gaze_pt, (0, 0, 0, p), value=-1.0) # Pad to have same length for batching
-            idx = p_annotations["id"].values.tolist() + [-1] * p 
+            gaze_pt = F.pad(gaze_pt, (0, 0, 0, p), value=-1.0)
+            idx = p_annotations["id"].values.tolist() + [-1] * p
             item = p_annotations.iloc[0]
-            
             gaze_label = item.gaze_gt_label
-            gaze_labels = item.gaze_gt_labels # string in the form class1-class2-...
-            gaze_label_id = torch.tensor(item.test_label_id) # GT test vocab
+            gaze_labels = item.gaze_gt_labels
+            gaze_label_id = torch.tensor(item.test_label_id)
             gaze_label_ids = torch.tensor([gaze_label_id])
             if gaze_label_id != -1:
                 gaze_label_ids = torch.tensor([self.vocab2id[label] for label in gaze_labels.split('-')])
             l = 5 - len(gaze_label_ids)
-            gaze_label_ids = F.pad(gaze_label_ids, (0, l), value=-1) # pad to 5 for batching
-            
+            gaze_label_ids = F.pad(gaze_label_ids, (0, l), value=-1)
 
-        # eyes_pt = torch.tensor([item["eye_x"], item["eye_y"]], dtype=torch.float) # not used
         inout = torch.tensor(item["inout"], dtype=torch.float)
         path = item["path"]
-        split, partition, img_name = item["path"].split('/')
-        basename, ext = os.path.splitext(img_name)
 
-        # Load image
-        image = Image.open(os.path.join(self.root, item["path"])).convert("RGB")
-        img_w, img_h = image.size
+        # --- Original, slow path: Load raw image and process ---
+        raw_image = Image.open(os.path.join(self.root, path)).convert("RGB")
+        img_w, img_h = raw_image.size
         
-        # Load target head bbox
         target_head_bbox = item[["head_xmin", "head_ymin", "head_xmax", "head_ymax"]]
         target_head_bbox = torch.from_numpy(target_head_bbox.values.astype(np.float32)).unsqueeze(0)
-        target_head_bbox = expand_bbox(target_head_bbox, img_w, img_h, k=0.1) # annotated boxes are a bit tight
+        target_head_bbox = expand_bbox(target_head_bbox, img_w, img_h, k=0.1)
 
-        # Load context head bboxes (if n > 1)
         context_head_bboxes = torch.zeros((0, 4))
         if (self.num_people == -1) or (self.num_people > 1):
-            det_file = f"{split}/{partition}/{basename}-head-detections.npy"
-            detections = np.load(os.path.join(self.root_heads, det_file))
-
-            # Process context head bboxes
-            if len(detections) > 0:
-                scores = torch.tensor(detections[:, -1])
-                context_head_bboxes = torch.tensor(detections[(scores >= self.head_thr).tolist(), :-1])
-                ious = box_iou(context_head_bboxes, target_head_bbox).flatten()
-                context_head_bboxes = context_head_bboxes[ious <= 0.5]
-
-            # Shuffle context people and keep the first `num_people - 1` indices
+            split_from_path, partition, basename_with_ext = path.split('/')
+            basename, _ = os.path.splitext(basename_with_ext)
+            det_file = f"{split_from_path}/{partition}/{basename}-head-detections.npy"
+            det_path = os.path.join(self.root_heads, det_file)
+            if os.path.exists(det_path):
+                detections = np.load(det_path)
+                if len(detections) > 0:
+                    scores = torch.tensor(detections[:, -1])
+                    context_head_bboxes = torch.tensor(detections[(scores >= self.head_thr).tolist(), :-1])
+                    ious = box_iou(context_head_bboxes, target_head_bbox).flatten()
+                    context_head_bboxes = context_head_bboxes[ious <= 0.5]
             if self.split == "train":
                 perm_indices = torch.randperm(context_head_bboxes.size(0))
                 context_head_bboxes = context_head_bboxes[perm_indices]
@@ -194,24 +188,20 @@ class GazeFollowDataset(Dataset):
             num_keep = num_context_heads if self.num_people == -1 else self.num_people - 1
             context_head_bboxes = context_head_bboxes[:num_keep]
 
-        # Concatenate main head bbox with others and apply jitter
         head_bboxes = torch.concat([context_head_bboxes, target_head_bbox], dim=0).to(torch.float)
         if self.split == "train":
             head_bboxes = self.jitter_bbox(head_bboxes, img_w, img_h)
 
-        # Square head bboxes (can have negative values)
         head_bboxes = square_bbox(head_bboxes, img_w, img_h)
-
-        # Extract Heads (negative values add padding)
         heads = []
         for head_bbox in head_bboxes:
-            heads.append(image.crop(head_bbox.int().tolist()))  # type:ignore
+            heads.append(raw_image.crop(head_bbox.int().tolist()))
 
-        # Normalize Head Bboxes and clip to [0, 1]
         head_bboxes /= torch.tensor([img_w, img_h, img_w, img_h], dtype=torch.float)
         head_bboxes = torch.clamp(head_bboxes, min=0.0, max=1.0)
         
-        # Load gaze label embeddings
+        image = raw_image
+
         if pd.isnull(gaze_label):
             gaze_label = gaze_labels = ""
             gaze_label_emb = torch.zeros(512)
@@ -219,8 +209,7 @@ class GazeFollowDataset(Dataset):
             label_emb_path = os.path.join(self.root_project, f"data/gazefollow/label-embeds/{gaze_label}-emb.pt")
             gaze_label_emb = torch.load(label_emb_path, weights_only=False)
             gaze_label_emb = F.normalize(gaze_label_emb, p=2, dim=-1)
-        
-        # Build Sample
+
         sample = {
             "image": image,
             "heads": heads,
@@ -237,43 +226,42 @@ class GazeFollowDataset(Dataset):
             "path": path,
         }
 
-        # Transform
         if self.transform:
             sample = self.transform(sample)
-            
-        # Pad missing people (ie. heads + bboxes)
-        num_heads = len(head_bboxes)
-        num_missing_heads = self.num_people - num_heads if self.num_people != -1 else 0
-        if num_missing_heads > 0:
-            pad = (0, 0, num_missing_heads, 0)
-            sample["head_bboxes"] = F.pad(sample["head_bboxes"], pad, mode="constant", value=0.)
-            if isinstance(sample["heads"], torch.Tensor):
-                pad = (0, 0, 0, 0, 0, 0, num_missing_heads, 0)
-                sample["heads"] = F.pad(sample["heads"], pad, mode="constant", value=0.)
-            else:
-                sample["heads"] = [Image.fromarray(np.zeros((224, 224, 3), dtype=np.uint8))] * num_missing_heads + heads
 
-        # Compute head centers
+        num_heads_current = len(sample["heads"])
+        num_target_people = self.num_people if self.num_people != -1 else num_heads_current
+        
+        num_missing_heads = num_target_people - num_heads_current
+
+        if num_missing_heads > 0:
+            pad_bbox = (0, 0, num_missing_heads, 0)
+            sample["head_bboxes"] = F.pad(sample["head_bboxes"], pad_bbox, mode="constant", value=0.)
+            
+            single_head_shape = sample["heads"].shape[1:] 
+            blank_head_tensors = torch.zeros((num_missing_heads, *single_head_shape), dtype=sample["heads"].dtype, device=sample["heads"].device)
+            sample["heads"] = torch.cat([sample["heads"], blank_head_tensors], dim=0)
+        elif num_missing_heads < 0:
+            sample["heads"] = sample["heads"][:num_target_people]
+            sample["head_bboxes"] = sample["head_bboxes"][:num_target_people]
+
         sample["head_centers"] = torch.hstack(
             [
                 (sample["head_bboxes"][:, [0]] + sample["head_bboxes"][:, [2]]) / 2,
                 (sample["head_bboxes"][:, [1]] + sample["head_bboxes"][:, [3]]) / 2,
             ]
         )
-        
-        # Generate gaze heatmap
+
         if sample["inout"] == 1.0:
-            sample["gaze_heatmap"] = generate_gaze_heatmap(sample["gaze_pt"], sigma=self.heatmap_sigma, size=self.heatmap_size)    
+            sample["gaze_heatmap"] = generate_gaze_heatmap(sample["gaze_pt"], sigma=self.heatmap_sigma, size=self.heatmap_size)
         else:
             sample["gaze_heatmap"] = torch.zeros((self.heatmap_size, self.heatmap_size), dtype=torch.float)
-        
-        # Compute gaze vector (only for target person)
+
         new_img_w, new_img_h = get_img_size(sample["image"])
         gaze_vec = sample["gaze_pt"] - sample["head_centers"][-1]
         gaze_vec = gaze_vec * torch.tensor([new_img_w, new_img_h])
         sample["gaze_vec"] = F.normalize(gaze_vec, p=2, dim=-1)
-        
-        # Generate head mask
+
         if self.return_head_mask:
             sample["head_masks"] = generate_mask(sample["head_bboxes"], new_img_w, new_img_h)
 
@@ -306,7 +294,7 @@ class GazeFollowDataModule(pl.LightningDataModule):
         self.image_size = pair(image_size)
         self.heatmap_sigma = heatmap_sigma
         self.heatmap_size = heatmap_size
-        self.num_people = num_people
+        self.num_people = {stage: num_people for stage in ["train", "val", "test"]} if isinstance(num_people, int) else num_people
         self.batch_size = {stage: batch_size for stage in ["train", "val", "test"]} if isinstance(batch_size, int) else batch_size
         self.return_head_mask = return_head_mask
         
@@ -322,6 +310,13 @@ class GazeFollowDataModule(pl.LightningDataModule):
                     Normalize(img_mean=IMG_MEAN, img_std=IMG_STD),
                 ]
             )
+            val_transform = Compose(
+                [
+                    Resize(img_size=self.image_size, head_size=(224, 224)),
+                    ToTensor(),
+                    Normalize(img_mean=IMG_MEAN, img_std=IMG_STD),
+                ]
+            )
             self.train_dataset = GazeFollowDataset(
                 self.root,
                 self.root_project,
@@ -331,7 +326,7 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 tr=(-0.1, 0.1),
                 heatmap_size=self.heatmap_size,
                 heatmap_sigma=self.heatmap_sigma,
-                num_people=self.num_people,
+                num_people=self.num_people['train'],
                 return_head_mask=self.return_head_mask,
             )
 
@@ -351,7 +346,7 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 tr=(0.0, 0.0),
                 heatmap_size=self.heatmap_size,
                 heatmap_sigma=self.heatmap_sigma,
-                num_people=self.num_people,
+                num_people=self.num_people['val'],
                 return_head_mask=self.return_head_mask,
             )
 
@@ -372,7 +367,7 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 tr=(0.0, 0.0),
                 heatmap_size=self.heatmap_size,
                 heatmap_sigma=self.heatmap_sigma,
-                num_people=self.num_people,
+                num_people=self.num_people['val'],
                 return_head_mask=self.return_head_mask,
             )
 
@@ -393,7 +388,7 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 tr=(0.0, 0.0),
                 heatmap_size=self.heatmap_size,
                 heatmap_sigma=self.heatmap_sigma,
-                num_people=self.num_people,
+                num_people=self.num_people['test'],
                 return_head_mask=self.return_head_mask,
             )
 

@@ -111,6 +111,10 @@ class GazeDecoder(nn.Module):
         gaze_heatmap = (gaze_heatmap_emb @ upscaled_image_tokens.view(b, c, h * w)) # (b, n, hm_h*hm_w)
         gaze_heatmap = gaze_heatmap.view(b, -1, h, w) # (b, n, hm_h, hm_w)
         
+        # Resize heatmap to match ground truth if needed
+        if gaze_heatmap.shape[-2:] != (64, 64):
+            gaze_heatmap = F.interpolate(gaze_heatmap, size=(64, 64), mode='bilinear', align_corners=False)
+
         # Predict gaze label
         gaze_label_emb = self.label_mlp(gaze_tokens) # (b*n, 512)
         gaze_label_emb = F.normalize(gaze_label_emb, p=2, dim=1).view(b, pn, -1) # (b, n, 512)
