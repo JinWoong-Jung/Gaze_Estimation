@@ -30,11 +30,21 @@ import pytorch_lightning as pl
 
 from semgaze.modeling.encoder import GazeEncoder, SpatialInputTokenizer, ViTEncoder
 from semgaze.modeling.decoder import GazeDecoder
-from semgaze.losses import compute_heatmap_loss, compute_angular_loss, compute_info_nce_loss
+from semgaze.losses import compute_heatmap_loss, compute_angular_loss, compute_info_nce_loss, compute_alignment_loss
 from semgaze.metrics import Distance, GFTestAUC, GFTestDistance, MultiAccuracy, GazeAccuracy
 from semgaze.utils.common import spatial_argmax2d, dark_coordinate_decoding
 
 TERM_COLOR = "cyan"
+
+
+def _cfg_get(cfg, path, default):
+    value = cfg
+    try:
+        for part in path.split("."):
+            value = getattr(value, part)
+        return value
+    except Exception:
+        return default
 
 # ==================================================================================================================
 #                                                   SEMGAZE MODULE                                                 #
@@ -52,6 +62,7 @@ class SemGazeModule(pl.LightningModule):
             decoder_depth=cfg.model.semgaze.decoder_depth, 
             decoder_num_heads=cfg.model.semgaze.decoder_num_heads, 
             decoder_label_emb_dim=512,
+            alignment_feature_dim=_cfg_get(cfg, "alignment.feature_dim", 768),
         )
 
         self.cfg = cfg
@@ -86,6 +97,12 @@ class SemGazeModule(pl.LightningModule):
 
         # Define logit scale parameter for loss computation
         self.logit_scale = nn.Parameter(torch.log(torch.tensor(1 / cfg.model.semgaze.temp_init_value)))
+        self.align_logit_scale = nn.Parameter(torch.log(torch.tensor(1 / _cfg_get(cfg, "alignment.temp_init_value", 0.07))))
+        self.align_enabled = bool(_cfg_get(cfg, "alignment.enabled", False))
+        self.align_train_only = bool(_cfg_get(cfg, "alignment.train_only", True))
+        self.align_layer_index = int(_cfg_get(cfg, "alignment.layer_index", 1))
+        self.align_loss_type = str(_cfg_get(cfg, "alignment.loss_type", "cosine")).lower()
+        self.align_weight = float(_cfg_get(cfg, "loss.weight_align", 0.0))
         
         # Initialize Weights
         self._init_weights()
@@ -94,8 +111,12 @@ class SemGazeModule(pl.LightningModule):
     def _init_weights(self):
         if self.cfg.model.weights is not None:
             model_ckpt = torch.load(self.cfg.model.weights, map_location="cpu", weights_only=False)  
-            self.load_state_dict(model_ckpt["state_dict"], strict=True)
+            missing, unexpected = self.load_state_dict(model_ckpt["state_dict"], strict=False)
             print(colored(f"Loaded the model pre-trained weights from {self.cfg.model.weights}.", TERM_COLOR))
+            if len(missing) > 0:
+                print(colored(f"Missing keys while loading checkpoint: {missing}", TERM_COLOR))
+            if len(unexpected) > 0:
+                print(colored(f"Unexpected keys while loading checkpoint: {unexpected}", TERM_COLOR))
             del model_ckpt
         else:
             # Load Gaze360 Weights for Gaze Encoder Backbone
@@ -145,8 +166,8 @@ class SemGazeModule(pl.LightningModule):
             self.freeze_module(self.model.gaze_decoder)
 
 
-    def forward(self, batch):
-        return self.model(batch)
+    def forward(self, batch, return_alignment=False):
+        return self.model(batch, return_alignment=return_alignment, align_layer_index=self.align_layer_index)
         
     
     def compute_loss(
@@ -178,10 +199,10 @@ class SemGazeModule(pl.LightningModule):
         )
 
         logs = {
-            "heatmap_loss": heatmap_loss.item(),
-            "label_loss": label_loss.item(),
-            "angular_loss": angular_loss.item(),
-            "total_loss": total_loss.item(),
+            "heatmap_loss": heatmap_loss.detach(),
+            "label_loss": label_loss.detach(),
+            "angular_loss": angular_loss.detach(),
+            "total_loss": total_loss.detach(),
         }
         return total_loss, logs
 
@@ -244,9 +265,15 @@ class SemGazeModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         n = len(batch["image"])
         ni = int(batch["inout"].sum().item())
+        align_path_active = self.align_enabled and ((not self.align_train_only) or self.training)
         
         # Forward pass
-        gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self(batch)
+        if align_path_active:
+            gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred, align_feat_pred = self(batch, return_alignment=True)
+            align_feat_pred = align_feat_pred[:, -1, ...]  # select last annotated person token
+        else:
+            gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self(batch, return_alignment=False)
+            align_feat_pred = None
         gaze_vec_pred = gaze_vec_pred[:, -1, ...] # (b, n, 64, 64) >> (b, 64, 64) / select last (annotated) person
         gaze_heatmap_pred = gaze_heatmap_pred[:, -1, ...] # (b, n, 64, 64) >> (b, 64, 64)
         gaze_label_emb_pred = gaze_label_emb_pred[:, -1, ...] # (b, n, 512) >> (b, 512)
@@ -262,11 +289,24 @@ class SemGazeModule(pl.LightningModule):
             gaze_label_emb_pred, 
         )
 
+        align_loss = torch.tensor(0.0, device=loss.device)
+        if align_path_active and align_feat_pred is not None:
+            align_loss = compute_alignment_loss(
+                emb_pred=align_feat_pred,
+                emb_gt=batch["reason_emb"],
+                valid_mask=batch["reason_valid"],
+                loss_type=self.align_loss_type,
+                logit_scale=self.align_logit_scale,
+            )
+            loss = loss + self.align_weight * align_loss
+
         # Logging losses
         self.log("loss/train/heatmap", logs["heatmap_loss"], batch_size=ni, prog_bar=False, on_step=True, on_epoch=True)
         self.log("loss/train/label", logs["label_loss"], batch_size=ni, prog_bar=False, on_step=True, on_epoch=True)
         self.log("loss/train/angular", logs["angular_loss"], batch_size=ni, prog_bar=False, on_step=True, on_epoch=True)
-        self.log("loss/train", logs["total_loss"], batch_size=n, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("loss/train/align", align_loss.detach(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("loss/train/base", logs["total_loss"], batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("loss/train", loss.detach(), batch_size=n, prog_bar=True, on_step=True, on_epoch=True)
 
         return {"loss": loss}
     
@@ -274,6 +314,7 @@ class SemGazeModule(pl.LightningModule):
     def on_after_backward(self):
         # Clipping temperature value
         self.logit_scale.data = torch.clamp(self.logit_scale.data, 0., 4.6052) # 4.6 = log(100)
+        self.align_logit_scale.data = torch.clamp(self.align_logit_scale.data, 0., 4.6052)
 
         
     def validation_step(self, batch, batch_idx):
@@ -281,7 +322,7 @@ class SemGazeModule(pl.LightningModule):
         ni = int(batch["inout"].sum().item())
         
         # Forward pass
-        gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self(batch)
+        gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self(batch, return_alignment=False)
         gaze_vec_pred = gaze_vec_pred[:, -1, ...] # (b, n, 64, 64) >> (b, 64, 64) / select last (annotated) person
         gaze_heatmap_pred = gaze_heatmap_pred[:, -1, ...]  # (b, 1, 64, 64) >> (b, 64, 64)
         gaze_pt_pred = spatial_argmax2d(gaze_heatmap_pred, normalize=True)  # (b, 2)
@@ -341,7 +382,7 @@ class SemGazeModule(pl.LightningModule):
         vocab_size = self.vocab_emb.size(0)
                 
         # Forward pass
-        gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self(batch)
+        gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self(batch, return_alignment=False)
         gaze_heatmap_pred = gaze_heatmap_pred[:, -1, ...]  # (b, 1, 64, 64) >> (b, 64, 64) / select last person
         gaze_pt_pred = dark_coordinate_decoding(gaze_heatmap_pred, kernel_size=self.cfg.data.heatmap_sigma * 3, normalize=True)       
         gaze_label_emb_pred = gaze_label_emb_pred[:, -1, ...] # (b, n, 512) >> (b, 512)
@@ -386,9 +427,10 @@ class SemGaze(nn.Module):
         token_dim: int = 768,
         gaze_vec_dim: int = 2,
         image_encoder_name: str = "facebook/dinov3-base",
-        decoder_depth: int = 2,
+        decoder_depth: int = 4,
         decoder_num_heads: int = 8,
         decoder_label_emb_dim: int = 512,
+        alignment_feature_dim: int = 768,
     ):
         super().__init__()
         
@@ -409,9 +451,10 @@ class SemGaze(nn.Module):
             num_heads=decoder_num_heads,
             label_emb_dim=decoder_label_emb_dim
         )
+        self.alignment_head = nn.Linear(token_dim, alignment_feature_dim)
 
 
-    def forward(self, sample):
+    def forward(self, sample, return_alignment: bool = False, align_layer_index: int = 1):
         # Expected sample = {"image": image, "heads": heads, "head_bboxes": head_bboxes}
         
         # Encode Gaze Tokens ===================================================
@@ -427,6 +470,16 @@ class SemGaze(nn.Module):
         image_tokens = image_tokens.permute(0, 2, 1).view(b, d, s, s) # (b, d, t) >> (b, d, s, s)
         
         # Decode Gaze Target =====================================================
-        gaze_heatmap, gaze_label_emb = self.gaze_decoder(image_tokens, gaze_tokens)  # (b, n, hm_h, hm_w), (b, n, 512)
+        if return_alignment:
+            gaze_heatmap, gaze_label_emb, align_tokens = self.gaze_decoder(
+                image_tokens,
+                gaze_tokens,
+                return_alignment_tokens=True,
+                align_layer_index=align_layer_index,
+            )
+            align_feat = self.alignment_head(align_tokens)
+            align_feat = F.normalize(align_feat, p=2, dim=-1)
+            return gaze_heatmap, gaze_vec, gaze_label_emb, align_feat
 
+        gaze_heatmap, gaze_label_emb = self.gaze_decoder(image_tokens, gaze_tokens)  # (b, n, hm_h, hm_w), (b, n, 512)
         return gaze_heatmap, gaze_vec, gaze_label_emb

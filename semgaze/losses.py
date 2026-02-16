@@ -44,3 +44,42 @@ def compute_angular_loss(gv_pred, gv_gt, io_gt):
     angular_loss = torch.mul(angular_loss, io_gt)
     angular_loss = torch.sum(angular_loss) / torch.sum(io_gt)
     return angular_loss
+
+
+def compute_alignment_loss(
+    emb_pred,
+    emb_gt,
+    valid_mask,
+    loss_type: str = "cosine",
+    logit_scale=None,
+):
+    mask = valid_mask.bool()
+    if torch.sum(mask) == 0:
+        return torch.tensor(0.0, device=emb_pred.device, dtype=emb_pred.dtype)
+
+    emb_pred = emb_pred[mask]
+    emb_gt = emb_gt[mask]
+
+    if loss_type == "cosine":
+        emb_pred = F.normalize(emb_pred, p=2, dim=-1)
+        emb_gt = F.normalize(emb_gt, p=2, dim=-1)
+        return (1 - torch.sum(emb_pred * emb_gt, dim=-1)).mean()
+
+    if loss_type == "mse":
+        return F.mse_loss(emb_pred, emb_gt, reduction="none").mean(dim=-1).mean()
+
+    if loss_type == "infonce":
+        emb_pred = F.normalize(emb_pred, p=2, dim=-1)
+        emb_gt = F.normalize(emb_gt, p=2, dim=-1)
+        n = emb_pred.size(0)
+        labels = torch.arange(n, device=emb_pred.device)
+        if logit_scale is None:
+            scale = 1.0
+        else:
+            scale = logit_scale.exp()
+        logits = emb_pred @ emb_gt.t() * scale
+        loss_i = F.cross_entropy(logits, labels)
+        loss_t = F.cross_entropy(logits.t(), labels)
+        return 0.5 * (loss_i + loss_t)
+
+    raise ValueError(f"Unsupported alignment loss type: {loss_type}")

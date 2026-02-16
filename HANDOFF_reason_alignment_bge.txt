@@ -1,0 +1,149 @@
+SemGaze Reason-Alignment (BGE) Handoff Notes
+Date: 2026-02-15
+
+Goal
+- Use gaze-follow reason txt files as supervision.
+- Convert each txt to a 768-dim feature using HuggingFace BGE (default: BAAI/bge-base-en-v1.5).
+- Add an alignment loss between BGE feature and the gaze decoder's 1st-layer output (configurable).
+- Enable alignment path ONLY for Train split (Val/Test unaffected).
+- If feature missing or load fails: use 0 vector and reason_valid=0, plus print warnings (rate-limited).
+
+Dataset / File Mapping (Verified)
+- Reason txt examples live under:
+  /home/elicer/semgaze/data/bucket_data/data/gazefollow_reason/output/train/<subdir>/<img_basename>_<id>.txt
+  Example:
+  /home/elicer/semgaze/data/bucket_data/data/gazefollow_reason/output/train/00000000/00000001_72111.txt
+
+- Training annotation path/id examples:
+  train/00000000/00000001.jpg,72111,...
+
+- Feature file mapping implemented as:
+  feature_path = <reason_feature_root>/<split_rel_dir>/<img_basename>_<id>.pt
+  where split_rel_dir == dirname(image_path) e.g. "train/00000000"
+
+Code Changes (Files)
+- Decoder: intermediate layer token extraction
+  semgaze/semgaze/modeling/decoder.py
+  - GazeDecoder.forward(..., return_alignment_tokens, align_layer_index)
+  - TwoWayTransformer.forward(..., return_intermediate_queries) collects per-layer queries
+
+- Loss: added alignment loss function
+  semgaze/semgaze/losses.py
+  - compute_alignment_loss(loss_type in {cosine,mse,infonce})
+
+- Model + Training loop: alignment path (train-only) + projection head
+  semgaze/semgaze/modeling/semgaze.py
+  - SemGaze has alignment_head: Linear(token_dim -> alignment_feature_dim), normalized output
+  - SemGazeModule.training_step:
+    - If alignment enabled: request decoder intermediate tokens, project, compute align loss
+    - total_loss = base_loss + (loss.weight_align * align_loss)
+    - Logs: loss/train/base, loss/train/align, loss/train
+  - Validation/Test explicitly call forward(return_alignment=False)
+  - Checkpoint loading changed to strict=False for cfg.model.weights to tolerate new keys
+
+- Gazefollow dataset: load precomputed reason embedding for train split
+  semgaze/semgaze/datasets/gazefollow.py
+  - Added fields per sample:
+    - reason_emb: (768,) float32 (zeros if missing)
+    - reason_valid: float32 scalar {0,1}
+  - Only attempts load when split == "train" and reason_feature_root is set
+  - Missing/failed loads print warnings with a log limit
+
+- DataModule wiring
+  semgaze/semgaze/datasets/gazefollow.py
+  - Train dataset receives reason_feature_root; Val/Test set it to None (train-only)
+
+- Experiment wiring: pass config paths to DataModule
+  semgaze/semgaze/experiments.py
+  - Uses OmegaConf.select for:
+    - data.gf.reason_feature_root
+    - alignment.feature_dim
+    - alignment.reason_log_limit
+
+- Config: add alignment options + feature root
+  semgaze/semgaze/conf/config_gf.yaml
+  - data.gf.reason_txt_root: /home/elicer/semgaze/data/bucket_data/data/gazefollow_reason/output
+  - data.gf.reason_feature_root: /home/elicer/semgaze/data/bucket_data/data/gazefollow_reason_bge/features
+  - loss.weight_align: 1.0
+  - alignment:
+    enabled: True
+    train_only: True
+    model_name: BAAI/bge-base-en-v1.5
+    text_mode: object_reasoning (supports object_only, reasoning_only)
+    feature_dim: 768
+    layer_index: 1 (1-based)
+    loss_type: cosine (supports mse, infonce)
+    temp_init_value: 0.07 (used for infonce)
+    reason_log_limit: 20
+
+New Script: BGE Feature Extraction (Precompute)
+- File:
+  semgaze/tools/extract_reason_features.py
+
+- What it does:
+  - Reads txt files from <input_root>/<split>/**/*.txt
+  - Parses "Object:" and "Reasoning:" lines
+  - text_mode:
+    - object_reasoning: embed "Object: ...\nReasoning: ..."
+    - object_only: embed only Object
+    - reasoning_only: embed only Reasoning
+  - Encodes using HF AutoModel + mean pooling + L2 normalize
+  - Saves float32 tensors to <output_root>/<split>/**/<same_name>.pt
+
+- Command example (train):
+  python /home/elicer/semgaze/tools/extract_reason_features.py \
+    --split train \
+    --input_root /home/elicer/semgaze/data/bucket_data/data/gazefollow_reason/output \
+    --output_root /home/elicer/semgaze/data/bucket_data/data/gazefollow_reason_bge/features \
+    --model_name BAAI/bge-base-en-v1.5 \
+    --text_mode object_reasoning
+
+- Notes:
+  - Use --device cpu if running on cheap CPU-only box (slow).
+  - HF model download requires internet or pre-baked cache.
+
+How Alignment Works (Implementation Details)
+- Predicted alignment feature:
+  - Take decoder intermediate "queries" at layer_index (1-based) from TwoWayTransformer
+  - Remove not-a-person token
+  - Select last person token (annotated person): align_feat_pred[:, -1, :]
+  - Project to 768 with alignment_head and normalize
+
+- Ground truth feature:
+  - batch["reason_emb"] loaded from .pt and normalized in dataset
+  - batch["reason_valid"] gates alignment loss (0 => contributes nothing)
+
+- Alignment loss types:
+  - cosine: mean(1 - cos(pred, gt))
+  - mse: mean squared error
+  - infonce: batch-wise symmetric cross entropy over pred<->gt, with align_logit_scale
+
+Quick Validation Checklist
+1) Feature extraction produced files:
+   ls /home/elicer/semgaze/data/bucket_data/data/gazefollow_reason_bge/features/train/00000000 | head
+   Expect: 00000001_72111.pt etc.
+2) Load a sample feature:
+   python - <<'PY'
+   import torch
+   p="/home/elicer/semgaze/data/bucket_data/data/gazefollow_reason_bge/features/train/00000000/00000001_72111.pt"
+   x=torch.load(p, map_location="cpu")
+   print(type(x), x.shape, x.dtype, x.norm().item())
+   PY
+   Expect: torch.Size([768]), float32, norm ~ 1.0
+3) Smoke train (small):
+   - Confirm loss/train/align logs and no crashes.
+
+Important Caveats
+- config dataclasses in semgaze/semgaze/config.py are not updated; training uses Hydra cfg but type hints may be stale.
+- If you load an old checkpoint via cfg.model.weights, strict=False is used; new alignment head weights will be randomly initialized.
+- Alignment path is train-only by design (dataset + forward logic), so val/test will ignore reason features.
+
+Files Changed Summary (git status short at time of writing)
+- M semgaze/conf/config_gf.yaml
+- M semgaze/datasets/gazefollow.py
+- M semgaze/experiments.py
+- M semgaze/losses.py
+- M semgaze/modeling/decoder.py
+- M semgaze/modeling/semgaze.py
+- A tools/extract_reason_features.py
+

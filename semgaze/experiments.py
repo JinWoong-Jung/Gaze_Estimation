@@ -88,6 +88,10 @@ class Experiment(BaseExperiment):
                 heatmap_sigma=self.cfg.data.heatmap_sigma,
                 num_people=self.cfg.data.num_people,
                 return_head_mask=self.cfg.data.return_head_mask,
+                reason_feature_root=omegaconf.OmegaConf.select(self.cfg, "data.gf.reason_feature_root", default=None),
+                reason_feature_preload=omegaconf.OmegaConf.select(self.cfg, "data.gf.reason_feature_preload", default=False),
+                reason_feature_dim=omegaconf.OmegaConf.select(self.cfg, "alignment.feature_dim", default=768),
+                reason_log_limit=omegaconf.OmegaConf.select(self.cfg, "alignment.reason_log_limit", default=20),
             )
         elif self.cfg.experiment.dataset == "gazehoi":
             data = GazeHOIDataModule(

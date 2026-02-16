@@ -9,6 +9,7 @@
 import os
 import json
 import h5py
+import time
 from typing import Dict, Union
 
 import numpy as np
@@ -55,6 +56,10 @@ class GazeFollowDataset(Dataset):
         num_people: int = 1,
         head_thr: float = 0.5,
         return_head_mask: bool = False,
+        reason_feature_root: Union[str, None] = None,
+        reason_feature_preload: bool = False,
+        reason_feature_dim: int = 768,
+        reason_log_limit: int = 20,
     ):
         super().__init__()
 
@@ -73,7 +78,81 @@ class GazeFollowDataset(Dataset):
         self.num_people = num_people
         self.head_thr = head_thr
         self.return_head_mask = return_head_mask
+        self.reason_feature_root = reason_feature_root
+        self.reason_feature_preload = reason_feature_preload
+        self.reason_feature_dim = reason_feature_dim
+        self.reason_log_limit = reason_log_limit
+        self.reason_warn_count = 0
+        self.label_emb_cache = {}
         self.annotations, self.vocab2id = self.load_annotations()
+        self.reason_feature_cache = None
+        if (self.split == "train") and (self.reason_feature_root is not None) and self.reason_feature_preload:
+            self.reason_feature_cache = self._build_reason_feature_cache()
+
+    def _warn_reason(self, msg: str):
+        if self.reason_warn_count < self.reason_log_limit:
+            print(f"[GazeFollowDataset][reason] {msg}")
+            self.reason_warn_count += 1
+            if self.reason_warn_count == self.reason_log_limit:
+                print("[GazeFollowDataset][reason] warning log limit reached; suppressing further messages.")
+
+    def _get_reason_feature_path(self, image_path: str, sample_id: Union[int, str]) -> str:
+        rel_dir = os.path.dirname(image_path)  # e.g. train/00000000
+        basename = os.path.splitext(os.path.basename(image_path))[0]
+        filename = f"{basename}_{sample_id}.pt"
+        return os.path.join(self.reason_feature_root, rel_dir, filename)
+
+    def _get_label_embedding(self, gaze_label: str) -> torch.Tensor:
+        if gaze_label not in self.label_emb_cache:
+            label_emb_path = os.path.join(self.root_project, f"data/gazefollow/label-embeds/{gaze_label}-emb.pt")
+            label_emb = torch.load(label_emb_path, weights_only=False).to(torch.float32)
+            label_emb = F.normalize(label_emb, p=2, dim=-1)
+            self.label_emb_cache[gaze_label] = label_emb
+        return self.label_emb_cache[gaze_label].clone()
+
+    def _build_reason_feature_cache(self):
+        reason_cache = {}
+        loaded_count = 0
+        missing_count = 0
+        failed_count = 0
+        total_count = len(self.annotations)
+        start_time = time.time()
+        print(
+            f"[GazeFollowDataset][reason] preload start: total={total_count}",
+            flush=True,
+        )
+
+        for index, item in enumerate(self.annotations.itertuples(index=False), start=1):
+            reason_path = self._get_reason_feature_path(item.path, item.id)
+            try:
+                reason_emb = torch.load(reason_path, map_location="cpu", weights_only=False).to(torch.float32)
+                reason_cache[reason_path] = F.normalize(reason_emb, p=2, dim=-1)
+                loaded_count += 1
+            except FileNotFoundError:
+                reason_cache[reason_path] = None
+                missing_count += 1
+            except Exception:
+                reason_cache[reason_path] = None
+                failed_count += 1
+
+            if (index % 10000 == 0) or (index == total_count):
+                elapsed = time.time() - start_time
+                speed = index / elapsed if elapsed > 0 else 0.0
+                print(
+                    f"[GazeFollowDataset][reason] preload progress: "
+                    f"{index}/{total_count} ({(100.0 * index / total_count):.1f}%), "
+                    f"loaded={loaded_count}, missing={missing_count}, failed={failed_count}, "
+                    f"speed={speed:.1f} files/s",
+                    flush=True,
+                )
+
+        total_elapsed = time.time() - start_time
+        print(
+            f"[GazeFollowDataset][reason] preload complete: "
+            f"loaded={loaded_count}, missing={missing_count}, failed={failed_count}, "
+            f"elapsed={total_elapsed:.1f}s"
+        )
+        return reason_cache
 
     def load_annotations(self) -> pd.DataFrame:
         annotations = pd.DataFrame()
@@ -204,11 +283,28 @@ class GazeFollowDataset(Dataset):
 
         if pd.isnull(gaze_label):
             gaze_label = gaze_labels = ""
-            gaze_label_emb = torch.zeros(512)
+            gaze_label_emb = torch.zeros(512, dtype=torch.float32)
         else:
-            label_emb_path = os.path.join(self.root_project, f"data/gazefollow/label-embeds/{gaze_label}-emb.pt")
-            gaze_label_emb = torch.load(label_emb_path, weights_only=False)
-            gaze_label_emb = F.normalize(gaze_label_emb, p=2, dim=-1)
+            gaze_label_emb = self._get_label_embedding(gaze_label)
+
+        reason_emb = torch.zeros(self.reason_feature_dim, dtype=torch.float32)
+        reason_valid = torch.tensor(0.0, dtype=torch.float32)
+        if (self.split == "train") and (self.reason_feature_root is not None):
+            reason_path = self._get_reason_feature_path(path, idx)
+            if self.reason_feature_cache is not None:
+                cached_reason_emb = self.reason_feature_cache.get(reason_path)
+                if cached_reason_emb is not None:
+                    reason_emb = cached_reason_emb
+                    reason_valid = torch.tensor(1.0, dtype=torch.float32)
+            else:
+                try:
+                    reason_emb = torch.load(reason_path, map_location="cpu", weights_only=False).to(torch.float32)
+                    reason_emb = F.normalize(reason_emb, p=2, dim=-1)
+                    reason_valid = torch.tensor(1.0, dtype=torch.float32)
+                except FileNotFoundError:
+                    self._warn_reason(f"missing feature file: {reason_path}")
+                except Exception as exc:
+                    self._warn_reason(f"failed loading feature: {reason_path} ({exc})")
 
         sample = {
             "image": image,
@@ -221,6 +317,8 @@ class GazeFollowDataset(Dataset):
             "gaze_label_ids": gaze_label_ids,
             "gaze_label_emb": gaze_label_emb,
             "inout": inout,
+            "reason_emb": reason_emb,
+            "reason_valid": reason_valid,
             "id": idx,
             "img_size": torch.tensor((img_w, img_h), dtype=torch.long),
             "path": path,
@@ -286,6 +384,10 @@ class GazeFollowDataModule(pl.LightningDataModule):
         heatmap_size: Union[int, tuple[int, int]] = 64,
         num_people: dict = {"train": 1, "val": 1, "test": 1},
         return_head_mask: bool = False,
+        reason_feature_root: Union[str, None] = None,
+        reason_feature_preload: bool = False,
+        reason_feature_dim: int = 768,
+        reason_log_limit: int = 20,
     ):
         super().__init__()
         self.root = root
@@ -297,6 +399,10 @@ class GazeFollowDataModule(pl.LightningDataModule):
         self.num_people = {stage: num_people for stage in ["train", "val", "test"]} if isinstance(num_people, int) else num_people
         self.batch_size = {stage: batch_size for stage in ["train", "val", "test"]} if isinstance(batch_size, int) else batch_size
         self.return_head_mask = return_head_mask
+        self.reason_feature_root = reason_feature_root
+        self.reason_feature_preload = reason_feature_preload
+        self.reason_feature_dim = reason_feature_dim
+        self.reason_log_limit = reason_log_limit
         
     def setup(self, stage: str):
         if stage == "fit":
@@ -328,6 +434,10 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 heatmap_sigma=self.heatmap_sigma,
                 num_people=self.num_people['train'],
                 return_head_mask=self.return_head_mask,
+                reason_feature_root=self.reason_feature_root,
+                reason_feature_preload=self.reason_feature_preload,
+                reason_feature_dim=self.reason_feature_dim,
+                reason_log_limit=self.reason_log_limit,
             )
 
             val_transform = Compose(
@@ -348,6 +458,10 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 heatmap_sigma=self.heatmap_sigma,
                 num_people=self.num_people['val'],
                 return_head_mask=self.return_head_mask,
+                reason_feature_root=None,
+                reason_feature_preload=False,
+                reason_feature_dim=self.reason_feature_dim,
+                reason_log_limit=self.reason_log_limit,
             )
 
         elif stage == "validate":
@@ -369,6 +483,10 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 heatmap_sigma=self.heatmap_sigma,
                 num_people=self.num_people['val'],
                 return_head_mask=self.return_head_mask,
+                reason_feature_root=None,
+                reason_feature_preload=False,
+                reason_feature_dim=self.reason_feature_dim,
+                reason_log_limit=self.reason_log_limit,
             )
 
         elif stage == "test":
@@ -390,6 +508,10 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 heatmap_sigma=self.heatmap_sigma,
                 num_people=self.num_people['test'],
                 return_head_mask=self.return_head_mask,
+                reason_feature_root=None,
+                reason_feature_preload=False,
+                reason_feature_dim=self.reason_feature_dim,
+                reason_log_limit=self.reason_log_limit,
             )
 
     def train_dataloader(self):
@@ -399,6 +521,8 @@ class GazeFollowDataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=8,
             pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=4,
         )
         return dataloader
 
@@ -409,6 +533,8 @@ class GazeFollowDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=8,
             pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=4,
         )
         return dataloader
 
@@ -419,5 +545,7 @@ class GazeFollowDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=8,
             pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=4,
         )
         return dataloader

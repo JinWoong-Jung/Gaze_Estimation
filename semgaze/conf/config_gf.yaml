@@ -20,7 +20,7 @@ project:
 # ------------------------------------------------------------------------------------------------------------------- #
 
 experiment:
-    name: semgaze_DINOv3(vit-b/16) # name of the wandb job
+    name: baseline(2-layers, alignment_path-cosine,w=1) # name of the wandb job
     group: null # name of the wandb group
     task: train+test # combination of {train, val, test} separated by '+' sign
     dataset: gazefollow # gazefollow, gazehoi
@@ -38,6 +38,9 @@ data:
         root: /home/elicer/semgaze/data/gazefollow_extended # FILL ME
         root_annotations: /home/elicer/semgaze/data/gazefollow_extended # FILL ME
         root_heads: /home/elicer/semgaze/data/GazeFollow-head # FILL ME (if needed)
+        reason_txt_root: /home/elicer/semgaze/data/bucket_data/data/gazefollow_reason/output
+        reason_feature_root: /home/elicer/semgaze/data/bucket_data/data/gazefollow_reason/features
+        reason_feature_preload: True
         num_train_samples: 108955
         vocab_size: 346
     gazehoi:
@@ -68,6 +71,20 @@ loss:
     weight_heatmap: 1000
     weight_angular: 3
     weight_label: 1
+    weight_align: 1
+
+# ------------------------------------------------------------------------------------------------------------------- #
+
+alignment:
+    enabled: True
+    train_only: True
+    model_name: BAAI/bge-base-en-v1.5
+    text_mode: object_reasoning # object_reasoning, reasoning_only, object_only
+    feature_dim: 768
+    layer_index: 1 # 1-based index in decoder transformer depth
+    loss_type: cosine # cosine, mse, infonce
+    temp_init_value: 0.07 # used when loss_type=infonce
+    reason_log_limit: 20
 
 # ------------------------------------------------------------------------------------------------------------------- #
 
@@ -86,7 +103,7 @@ scheduler:
 train: 
     seed: 10 # int or null for no seed
     matmul_precision: highest # highest (default), high, medium
-    precision: 32 # 64 (double), 32 (full), 16 (16bit mixed), bf16-mixed (bfloat16 mixed). Defaults to 32.
+    precision: bf16-mixed # 64 (double), 32 (full), 16 (16bit mixed), bf16-mixed (bfloat16 mixed). Defaults to 32.
     epochs: 20
     batch_size: 300
     accumulate_grad_batches: 1 # 1 (default, no accumulation)

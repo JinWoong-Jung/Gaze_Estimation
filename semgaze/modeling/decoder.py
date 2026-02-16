@@ -72,6 +72,8 @@ class GazeDecoder(nn.Module):
         self,
         image_tokens: torch.Tensor,
         gaze_tokens: torch.Tensor,
+        return_alignment_tokens: bool = False,
+        align_layer_index: int = 1,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Predict gaze heatmaps and gaze label embeddings given image and gaze tokens.
@@ -94,7 +96,18 @@ class GazeDecoder(nn.Module):
 
         # Run the transformer
         image_tokens = image_tokens.view(b, ic, ih*iw).permute(0, 2, 1) # (b, c, h, w) >> (b, h*w, c)
-        gaze_tokens, image_tokens = self.transformer(gaze_tokens, image_tokens)  # (b, n, c) & (b, h*w, c)
+        if return_alignment_tokens:
+            align_idx = max(1, min(int(align_layer_index), self.depth)) - 1
+            gaze_tokens, image_tokens, align_query = self.transformer(
+                gaze_tokens,
+                image_tokens,
+                return_intermediate_queries=True,
+                intermediate_query_index=align_idx,
+            )
+            align_tokens = align_query[:, :-1, :]  # remove not-a-person token
+        else:
+            gaze_tokens, image_tokens = self.transformer(gaze_tokens, image_tokens)  # (b, n, c) & (b, h*w, c)
+            align_tokens = None
         image_tokens = image_tokens.permute(0, 2, 1).view(b, ic, ih, iw) # (b, h*w, c) >> (b, c, h, w)
         
         # Upscale mask embeddings
@@ -119,6 +132,8 @@ class GazeDecoder(nn.Module):
         gaze_label_emb = self.label_mlp(gaze_tokens) # (b*n, 512)
         gaze_label_emb = F.normalize(gaze_label_emb, p=2, dim=1).view(b, pn, -1) # (b, n, 512)
 
+        if return_alignment_tokens:
+            return gaze_heatmap, gaze_label_emb, align_tokens
         return gaze_heatmap, gaze_label_emb
 
 
@@ -195,6 +210,8 @@ class TwoWayTransformer(nn.Module):
         self,
         queries: Tensor,
         context: Tensor,
+        return_intermediate_queries: bool = False,
+        intermediate_query_index: int = 0,
     ) -> Tuple[Tensor, Tensor]:
         """
         Args:
@@ -209,14 +226,22 @@ class TwoWayTransformer(nn.Module):
         """
 
         # Apply transformer blocks
-        for layer in self.layers:
+        intermediate_query = None
+        target_query_idx = max(0, min(int(intermediate_query_index), len(self.layers) - 1))
+        for layer_idx, layer in enumerate(self.layers):
             queries, context = layer(queries=queries, context=context)
+            if return_intermediate_queries and layer_idx == target_query_idx:
+                intermediate_query = queries
 
         # Apply the final attention layer from gaze tokens to image tokens
         attn_out = self.final_attn_gaze_to_image(q=queries, k=context, v=context)
         queries = queries + attn_out
         queries = self.norm_final_attn(queries)
 
+        if return_intermediate_queries:
+            if intermediate_query is None:
+                intermediate_query = queries
+            return queries, context, intermediate_query
         return queries, context
 
 
