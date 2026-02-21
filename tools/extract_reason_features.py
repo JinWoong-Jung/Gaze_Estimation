@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 from typing import List, Tuple
 
+import h5py
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -54,18 +55,22 @@ def parse_reason_text(raw_text: str, text_mode: str) -> str:
     object_text = ""
     reasoning_text = ""
     for line in lines:
-        lower = line.lower()
-        if lower.startswith("object:"):
-            object_text = line.split(":", 1)[1].strip()
-        elif lower.startswith("reasoning:"):
-            reasoning_text = line.split(":", 1)[1].strip()
+        left, sep, right = line.partition(":")
+        if not sep:
+            continue
+        key = left.strip().lower()
+        value = right.strip()
+        if key == "object":
+            object_text = value
+        elif key in {"reason", "reasoning"}:
+            reasoning_text = value
 
     if text_mode == "object_reasoning":
         parts = []
         if object_text:
-            parts.append(f"Object: {object_text}")
+            parts.append(object_text)
         if reasoning_text:
-            parts.append(f"Reasoning: {reasoning_text}")
+            parts.append(reasoning_text)
         if parts:
             return "\n".join(parts)
     elif text_mode == "object_only":
@@ -116,9 +121,9 @@ def gather_files(input_root: Path, split: str) -> List[Path]:
     return sorted(split_dir.rglob("*.txt"))
 
 
-def build_output_path(output_root: Path, input_root: Path, split: str, txt_path: Path) -> Path:
+def build_output_key(input_root: Path, split: str, txt_path: Path) -> str:
     rel = txt_path.relative_to(input_root / split)
-    return output_root / split / rel.with_suffix(".pt")
+    return str(rel.with_suffix(""))
 
 
 def run(args):
@@ -137,6 +142,8 @@ def run(args):
 
     files = gather_files(input_root, args.split)
     print(f"Found {len(files)} txt files for split={args.split}")
+    output_root.mkdir(parents=True, exist_ok=True)
+    output_h5_path = output_root / f"{args.split}.h5"
 
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
     AutoModel, AutoTokenizer = import_transformers()
@@ -149,42 +156,82 @@ def run(args):
     failed = 0
     encoded = 0
     texts: List[str] = []
-    out_paths: List[Path] = []
+    out_keys: List[str] = []
 
-    pbar = tqdm(files, desc="Extracting BGE features")
-    for txt_path in pbar:
-        out_path = build_output_path(output_root, input_root, args.split, txt_path)
-        if out_path.exists() and (not args.overwrite):
-            skipped_existing += 1
-            continue
+    if output_h5_path.exists() and args.overwrite:
+        output_h5_path.unlink()
 
-        try:
-            raw_text = txt_path.read_text(encoding="utf-8")
-            text = parse_reason_text(raw_text, args.text_mode)
-        except Exception as exc:
-            failed += 1
-            print(f"[WARN] Failed reading/parsing {txt_path}: {exc}")
-            continue
+    with h5py.File(output_h5_path, "a") as h5f:
+        str_dtype = h5py.string_dtype(encoding="utf-8")
+        if "keys" not in h5f:
+            keys_ds = h5f.create_dataset("keys", shape=(0,), maxshape=(None,), dtype=str_dtype)
+        else:
+            keys_ds = h5f["keys"]
 
-        texts.append(text)
-        out_paths.append(out_path)
+        if "embeddings" not in h5f:
+            emb_ds = None
+        else:
+            emb_ds = h5f["embeddings"]
 
-        if len(texts) >= args.batch_size:
+        existing_keys = set()
+        if not args.overwrite and len(keys_ds) > 0:
+            existing_keys = {k.decode("utf-8") if isinstance(k, bytes) else str(k) for k in keys_ds[:]}
+
+        def append_to_h5(batch_keys: List[str], batch_emb: torch.Tensor):
+            nonlocal emb_ds, encoded
+            batch_np = batch_emb.to(torch.float32).numpy()
+            if emb_ds is None:
+                emb_dim = int(batch_np.shape[1])
+                emb_ds = h5f.create_dataset(
+                    "embeddings",
+                    shape=(0, emb_dim),
+                    maxshape=(None, emb_dim),
+                    chunks=(max(1, min(args.batch_size, 1024)), emb_dim),
+                    dtype="float32",
+                )
+            old_n = emb_ds.shape[0]
+            new_n = old_n + len(batch_keys)
+            emb_ds.resize((new_n, emb_ds.shape[1]))
+            keys_ds.resize((new_n,))
+            emb_ds[old_n:new_n] = batch_np
+            keys_ds[old_n:new_n] = batch_keys
+            encoded += len(batch_keys)
+
+        pbar = tqdm(files, desc="Extracting BGE features")
+        for txt_path in pbar:
+            out_key = build_output_key(input_root, args.split, txt_path)
+            if (not args.overwrite) and (out_key in existing_keys):
+                skipped_existing += 1
+                continue
+
+            try:
+                raw_text = txt_path.read_text(encoding="utf-8")
+                text = parse_reason_text(raw_text, args.text_mode)
+            except Exception as exc:
+                failed += 1
+                print(f"[WARN] Failed reading/parsing {txt_path}: {exc}")
+                continue
+
+            texts.append(text)
+            out_keys.append(out_key)
+
+            if len(texts) >= args.batch_size:
+                emb = encode_batch(model, tokenizer, texts, device, args.max_length)
+                append_to_h5(out_keys, emb)
+                existing_keys.update(out_keys)
+                texts, out_keys = [], []
+
+        if texts:
             emb = encode_batch(model, tokenizer, texts, device, args.max_length)
-            for feature, save_path in zip(emb, out_paths):
-                save_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(feature.to(torch.float32), save_path)
-                encoded += 1
-            texts, out_paths = [], []
+            append_to_h5(out_keys, emb)
+            existing_keys.update(out_keys)
 
-    if texts:
-        emb = encode_batch(model, tokenizer, texts, device, args.max_length)
-        for feature, save_path in zip(emb, out_paths):
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(feature.to(torch.float32), save_path)
-            encoded += 1
+        h5f.attrs["model_name"] = args.model_name
+        h5f.attrs["text_mode"] = args.text_mode
+        h5f.attrs["split"] = args.split
 
     print("Done.")
+    print(f"output_h5={output_h5_path}")
     print(f"encoded={encoded}")
     print(f"skipped_existing={skipped_existing}")
     print(f"failed={failed}")
@@ -201,20 +248,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_root",
         type=str,
-        default="/home/elicer/semgaze/data/bucket_data/data/gazefollow_reason/features",
-        help="Output root directory for extracted .pt embeddings.",
+        default="/home/elicer/semgaze/data/gazefollow_reason/features",
+        help="Output root directory for extracted .h5 embeddings (one file per split).",
     )
     parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"])
-    parser.add_argument("--model_name", type=str, default="BAAI/bge-base-en-v1.5")
+    parser.add_argument("--model_name", type=str, default="BAAI/bge-large-en-v1.5")
     parser.add_argument(
         "--text_mode",
         type=str,
-        default="object_reasoning",
+        default="reasoning_only",
         choices=["object_reasoning", "object_only", "reasoning_only"],
     )
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--max_length", type=int, default=512)
-    parser.add_argument("--device", type=str, default="auto", help="auto, cuda, cpu")
+    parser.add_argument("--device", type=str, default="cuda", help="auto, cuda, cpu")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing feature files")
     args = parser.parse_args()
     run(args)

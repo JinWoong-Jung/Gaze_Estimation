@@ -85,9 +85,11 @@ class GazeFollowDataset(Dataset):
         self.reason_warn_count = 0
         self.label_emb_cache = {}
         self.annotations, self.vocab2id = self.load_annotations()
-        self.reason_feature_cache = None
-        if (self.split == "train") and (self.reason_feature_root is not None) and self.reason_feature_preload:
-            self.reason_feature_cache = self._build_reason_feature_cache()
+        self.reason_feature_h5_path = None
+        self.reason_feature_h5 = None
+        self.reason_feature_index = None
+        if (self.split == "train") and (self.reason_feature_root is not None):
+            self.reason_feature_h5_path = os.path.join(self.reason_feature_root, f"{self.split}.h5")
 
     def _warn_reason(self, msg: str):
         if self.reason_warn_count < self.reason_log_limit:
@@ -96,11 +98,14 @@ class GazeFollowDataset(Dataset):
             if self.reason_warn_count == self.reason_log_limit:
                 print("[GazeFollowDataset][reason] warning log limit reached; suppressing further messages.")
 
-    def _get_reason_feature_path(self, image_path: str, sample_id: Union[int, str]) -> str:
+    def _get_reason_feature_key(self, image_path: str, sample_id: Union[int, str]) -> str:
         rel_dir = os.path.dirname(image_path)  # e.g. train/00000000
+        split_prefix = f"{self.split}/"
+        if rel_dir.startswith(split_prefix):
+            rel_dir = rel_dir[len(split_prefix):]
         basename = os.path.splitext(os.path.basename(image_path))[0]
-        filename = f"{basename}_{sample_id}.pt"
-        return os.path.join(self.reason_feature_root, rel_dir, filename)
+        filename = f"{basename}_{sample_id}"
+        return os.path.join(rel_dir, filename)
 
     def _get_label_embedding(self, gaze_label: str) -> torch.Tensor:
         if gaze_label not in self.label_emb_cache:
@@ -110,49 +115,61 @@ class GazeFollowDataset(Dataset):
             self.label_emb_cache[gaze_label] = label_emb
         return self.label_emb_cache[gaze_label].clone()
 
-    def _build_reason_feature_cache(self):
-        reason_cache = {}
-        loaded_count = 0
-        missing_count = 0
-        failed_count = 0
-        total_count = len(self.annotations)
+    def _ensure_reason_feature_h5(self):
+        if self.reason_feature_h5 is not None:
+            return True
+        if self.reason_feature_h5_path is None:
+            return False
+        if not os.path.exists(self.reason_feature_h5_path):
+            self._warn_reason(f"missing h5 feature file: {self.reason_feature_h5_path}")
+            return False
+        try:
+            self.reason_feature_h5 = h5py.File(self.reason_feature_h5_path, "r")
+            return True
+        except Exception as exc:
+            self._warn_reason(f"failed opening h5 feature file: {self.reason_feature_h5_path} ({exc})")
+            self.reason_feature_h5 = None
+            return False
+
+    def _build_reason_feature_index(self):
+        if not self._ensure_reason_feature_h5():
+            return {}
         start_time = time.time()
+        index = {}
+        keys_ds = self.reason_feature_h5.get("keys")
+        if keys_ds is None:
+            self._warn_reason(f"missing dataset `keys` in h5: {self.reason_feature_h5_path}")
+            return index
+        for i, key in enumerate(keys_ds):
+            if isinstance(key, bytes):
+                key = key.decode("utf-8")
+            index[str(key)] = i
+        elapsed = time.time() - start_time
         print(
-            f"[GazeFollowDataset][reason] preload start: total={total_count}",
-            flush=True,
+            f"[GazeFollowDataset][reason] preload index complete: "
+            f"entries={len(index)}, elapsed={elapsed:.1f}s"
         )
+        return index
 
-        for index, item in enumerate(self.annotations.itertuples(index=False), start=1):
-            reason_path = self._get_reason_feature_path(item.path, item.id)
-            try:
-                reason_emb = torch.load(reason_path, map_location="cpu", weights_only=False).to(torch.float32)
-                reason_cache[reason_path] = F.normalize(reason_emb, p=2, dim=-1)
-                loaded_count += 1
-            except FileNotFoundError:
-                reason_cache[reason_path] = None
-                missing_count += 1
-            except Exception:
-                reason_cache[reason_path] = None
-                failed_count += 1
-
-            if (index % 10000 == 0) or (index == total_count):
-                elapsed = time.time() - start_time
-                speed = index / elapsed if elapsed > 0 else 0.0
-                print(
-                    f"[GazeFollowDataset][reason] preload progress: "
-                    f"{index}/{total_count} ({(100.0 * index / total_count):.1f}%), "
-                    f"loaded={loaded_count}, missing={missing_count}, failed={failed_count}, "
-                    f"speed={speed:.1f} files/s",
-                    flush=True,
-                )
-
-        total_elapsed = time.time() - start_time
-        print(
-            f"[GazeFollowDataset][reason] preload complete: "
-            f"loaded={loaded_count}, missing={missing_count}, failed={failed_count}, "
-            f"elapsed={total_elapsed:.1f}s"
-        )
-        return reason_cache
+    def _load_reason_feature_from_h5(self, reason_key: str):
+        if not self._ensure_reason_feature_h5():
+            return None
+        if self.reason_feature_index is None:
+            self.reason_feature_index = self._build_reason_feature_index()
+        emb_ds = self.reason_feature_h5.get("embeddings")
+        if emb_ds is None:
+            self._warn_reason(f"missing dataset `embeddings` in h5: {self.reason_feature_h5_path}")
+            return None
+        row_idx = self.reason_feature_index.get(reason_key)
+        if row_idx is None:
+            return None
+        try:
+            emb = torch.from_numpy(emb_ds[row_idx]).to(torch.float32)
+            emb = F.normalize(emb, p=2, dim=-1)
+            return emb
+        except Exception as exc:
+            self._warn_reason(f"failed loading h5 feature: key={reason_key} ({exc})")
+            return None
 
     def load_annotations(self) -> pd.DataFrame:
         annotations = pd.DataFrame()
@@ -290,21 +307,13 @@ class GazeFollowDataset(Dataset):
         reason_emb = torch.zeros(self.reason_feature_dim, dtype=torch.float32)
         reason_valid = torch.tensor(0.0, dtype=torch.float32)
         if (self.split == "train") and (self.reason_feature_root is not None):
-            reason_path = self._get_reason_feature_path(path, idx)
-            if self.reason_feature_cache is not None:
-                cached_reason_emb = self.reason_feature_cache.get(reason_path)
-                if cached_reason_emb is not None:
-                    reason_emb = cached_reason_emb
-                    reason_valid = torch.tensor(1.0, dtype=torch.float32)
+            reason_key = self._get_reason_feature_key(path, idx)
+            loaded_reason_emb = self._load_reason_feature_from_h5(reason_key)
+            if loaded_reason_emb is not None:
+                reason_emb = loaded_reason_emb
+                reason_valid = torch.tensor(1.0, dtype=torch.float32)
             else:
-                try:
-                    reason_emb = torch.load(reason_path, map_location="cpu", weights_only=False).to(torch.float32)
-                    reason_emb = F.normalize(reason_emb, p=2, dim=-1)
-                    reason_valid = torch.tensor(1.0, dtype=torch.float32)
-                except FileNotFoundError:
-                    self._warn_reason(f"missing feature file: {reason_path}")
-                except Exception as exc:
-                    self._warn_reason(f"failed loading feature: {reason_path} ({exc})")
+                self._warn_reason(f"missing h5 feature key: {reason_key}")
 
         sample = {
             "image": image,

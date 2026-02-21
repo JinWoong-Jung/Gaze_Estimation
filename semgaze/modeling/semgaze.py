@@ -451,7 +451,11 @@ class SemGaze(nn.Module):
             num_heads=decoder_num_heads,
             label_emb_dim=decoder_label_emb_dim
         )
-        self.alignment_head = nn.Linear(token_dim, alignment_feature_dim)
+        self.alignment_head = nn.Sequential(
+            nn.Linear(token_dim, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, alignment_feature_dim),
+        )
 
 
     def forward(self, sample, return_alignment: bool = False, align_layer_index: int = 1):

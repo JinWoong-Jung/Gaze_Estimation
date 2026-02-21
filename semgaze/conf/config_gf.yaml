@@ -20,7 +20,7 @@ project:
 # ------------------------------------------------------------------------------------------------------------------- #
 
 experiment:
-    name: baseline(2-layers, alignment_path-cosine,w=1) # name of the wandb job
+    name: baseline(2-layers, align=(1-layers, 2-MLP), cos, w=100) # name of the wandb job
     group: null # name of the wandb group
     task: train+test # combination of {train, val, test} separated by '+' sign
     dataset: gazefollow # gazefollow, gazehoi
@@ -39,8 +39,8 @@ data:
         root_annotations: /home/elicer/semgaze/data/gazefollow_extended # FILL ME
         root_heads: /home/elicer/semgaze/data/GazeFollow-head # FILL ME (if needed)
         reason_txt_root: /home/elicer/semgaze/data/bucket_data/data/gazefollow_reason/output
-        reason_feature_root: /home/elicer/semgaze/data/bucket_data/data/gazefollow_reason/features
-        reason_feature_preload: True
+        reason_feature_root: /home/elicer/semgaze/data/gazefollow_reason/features
+        reason_feature_preload: False
         num_train_samples: 108955
         vocab_size: 346
     gazehoi:
@@ -71,16 +71,16 @@ loss:
     weight_heatmap: 1000
     weight_angular: 3
     weight_label: 1
-    weight_align: 1
+    weight_align: 100
 
 # ------------------------------------------------------------------------------------------------------------------- #
 
 alignment:
     enabled: True
     train_only: True
-    model_name: BAAI/bge-base-en-v1.5
-    text_mode: object_reasoning # object_reasoning, reasoning_only, object_only
-    feature_dim: 768
+    model_name: BAAI/bge-large-en-v1.5
+    text_mode: reasoning_only # object_reasoning, reasoning_only, object_only
+    feature_dim: 1024
     layer_index: 1 # 1-based index in decoder transformer depth
     loss_type: cosine # cosine, mse, infonce
     temp_init_value: 0.07 # used when loss_type=infonce
