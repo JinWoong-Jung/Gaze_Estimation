@@ -186,7 +186,7 @@ class Experiment(BaseExperiment):
             gradient_clip_algorithm=None,  # "value" or "norm"
             deterministic=False,  # guarantee reproducible results by removing most of the randomness from training, but may slow it down.
             benchmark=True,  # set to True to speed up training if the input sizes for your model are fixed (e.g. during inference).
-            inference_mode=False,  # Whether to use torch.inference_mode() or torch.no_grad() during evaluation (ie. validate/test/predict)
+            inference_mode=True,  # Whether to use torch.inference_mode() or torch.no_grad() during evaluation (ie. validate/test/predict)
             profiler=profiler,  # None, "simple" or "advanced" to identify bottlenecks
             detect_anomaly=False,  # Enable anomaly detection for the autograd engine
         )

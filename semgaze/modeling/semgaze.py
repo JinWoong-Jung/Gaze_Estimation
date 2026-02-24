@@ -209,9 +209,23 @@ class SemGazeModule(pl.LightningModule):
     
     def configure_optimizers(self):
         # Optimizer
+        base_lr = float(self.cfg.optimizer.lr)
+        head_lr_mult = float(_cfg_get(self.cfg, "alignment.head_lr_mult", 1.0))
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+        optimizer_params = trainable_params
+        if self.align_enabled and (head_lr_mult != 1.0):
+            align_head_param_ids = {id(p) for p in self.model.alignment_head.parameters() if p.requires_grad}
+            align_head_params = [p for p in trainable_params if id(p) in align_head_param_ids]
+            base_params = [p for p in trainable_params if id(p) not in align_head_param_ids]
+            if len(align_head_params) > 0:
+                optimizer_params = []
+                if len(base_params) > 0:
+                    optimizer_params.append({"params": base_params, "lr": base_lr})
+                optimizer_params.append({"params": align_head_params, "lr": base_lr * head_lr_mult})
+
         optimizer = optim.AdamW(
-            filter(lambda p: p.requires_grad, self.parameters()), 
-            lr=self.cfg.optimizer.lr, 
+            optimizer_params,
+            lr=base_lr,
             weight_decay=self.cfg.optimizer.weight_decay
         ) 
         
@@ -265,6 +279,9 @@ class SemGazeModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         n = len(batch["image"])
         ni = int(batch["inout"].sum().item())
+        inout_mask = batch["inout"] > 0.5
+        reason_valid_mask = batch["reason_valid"] > 0.5
+        align_valid_mask = reason_valid_mask & inout_mask
         align_path_active = self.align_enabled and ((not self.align_train_only) or self.training)
         
         # Forward pass
@@ -294,7 +311,7 @@ class SemGazeModule(pl.LightningModule):
             align_loss = compute_alignment_loss(
                 emb_pred=align_feat_pred,
                 emb_gt=batch["reason_emb"],
-                valid_mask=batch["reason_valid"],
+                valid_mask=align_valid_mask,
                 loss_type=self.align_loss_type,
                 logit_scale=self.align_logit_scale,
             )
@@ -306,6 +323,10 @@ class SemGazeModule(pl.LightningModule):
         self.log("loss/train/angular", logs["angular_loss"], batch_size=ni, prog_bar=False, on_step=True, on_epoch=True)
         self.log("loss/train/align", align_loss.detach(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
         self.log("loss/train/base", logs["total_loss"], batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("stats/train/inout_ratio", inout_mask.float().mean(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("stats/train/reason_valid_ratio", reason_valid_mask.float().mean(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("stats/train/align_mask_ratio", align_valid_mask.float().mean(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("stats/train/align_mask_count", align_valid_mask.float().sum(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
         self.log("loss/train", loss.detach(), batch_size=n, prog_bar=True, on_step=True, on_epoch=True)
 
         return {"loss": loss}
@@ -427,10 +448,10 @@ class SemGaze(nn.Module):
         token_dim: int = 768,
         gaze_vec_dim: int = 2,
         image_encoder_name: str = "facebook/dinov3-base",
-        decoder_depth: int = 4,
+        decoder_depth: int = 2,
         decoder_num_heads: int = 8,
         decoder_label_emb_dim: int = 512,
-        alignment_feature_dim: int = 768,
+        alignment_feature_dim: int = 1024,
     ):
         super().__init__()
         
@@ -451,10 +472,13 @@ class SemGaze(nn.Module):
             num_heads=decoder_num_heads,
             label_emb_dim=decoder_label_emb_dim
         )
+        align_hidden_dim = (token_dim + alignment_feature_dim) // 2
         self.alignment_head = nn.Sequential(
-            nn.Linear(token_dim, token_dim),
+            nn.LayerNorm(token_dim),
+            nn.Linear(token_dim, align_hidden_dim),
             nn.GELU(),
-            nn.Linear(token_dim, alignment_feature_dim),
+            nn.Dropout(p=0.1),
+            nn.Linear(align_hidden_dim, alignment_feature_dim),
         )
 
 

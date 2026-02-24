@@ -20,7 +20,7 @@ project:
 # ------------------------------------------------------------------------------------------------------------------- #
 
 experiment:
-    name: baseline(2-layers, align=(1-layers, 2-MLP), cos, w=100) # name of the wandb job
+    name: baseline(2-layers, mse, w=1, edited2) # name of the wandb job
     group: null # name of the wandb group
     task: train+test # combination of {train, val, test} separated by '+' sign
     dataset: gazefollow # gazefollow, gazehoi
@@ -71,7 +71,7 @@ loss:
     weight_heatmap: 1000
     weight_angular: 3
     weight_label: 1
-    weight_align: 100
+    weight_align: 1
 
 # ------------------------------------------------------------------------------------------------------------------- #
 
@@ -82,7 +82,8 @@ alignment:
     text_mode: reasoning_only # object_reasoning, reasoning_only, object_only
     feature_dim: 1024
     layer_index: 1 # 1-based index in decoder transformer depth
-    loss_type: cosine # cosine, mse, infonce
+    loss_type: mse # cosine, mse, infonce
+    head_lr_mult: 3.0
     temp_init_value: 0.07 # used when loss_type=infonce
     reason_log_limit: 20
 

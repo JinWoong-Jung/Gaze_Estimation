@@ -250,6 +250,11 @@ class RandomCropSafeGaze(object):
                 
                 sample["inout"] = 1. - sample["inout"]
                 sample["gaze_pt"] = torch.tensor([-1., -1.], dtype=torch.float)
+                if "reason_valid" in sample:
+                    if torch.is_tensor(sample["reason_valid"]):
+                        sample["reason_valid"] = torch.zeros_like(sample["reason_valid"], dtype=torch.float32)
+                    else:
+                        sample["reason_valid"] = 0.0
 
             # Convert Gaze Points (only if still inside)
             if sample["inout"] == 1.:
