@@ -20,7 +20,7 @@ project:
 # ------------------------------------------------------------------------------------------------------------------- #
 
 experiment:
-    name: baseline(2-layers, mse, w=1, edited2) # name of the wandb job
+    name: baseline(2-layers, mse, w=1, LoRA, no recog, ViT-L) # name of the wandb job
     group: null # name of the wandb group
     task: train+test # combination of {train, val, test} separated by '+' sign
     dataset: gazefollow # gazefollow, gazehoi
@@ -54,13 +54,19 @@ data:
 model:
     semgaze:
         patch_size: 16
-        token_dim: 768
+        token_dim: 1024 # ViT-L/16: 1024, ViT-B/16: 768
         image_size: ${data.image_size}
         gaze_vec_dim: 2
-        image_encoder_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+        image_encoder_name: facebook/dinov3-vitl16-pretrain-lvd1689m # facebook/dinov3-vitl16-pretrain-lvd1689m or facebook/dinov3-vitb16-pretrain-lvd1689m
         decoder_depth: 2
         decoder_num_heads: 8
         temp_init_value: 0.07
+        image_encoder_lora:
+            enabled: True
+            r: 8
+            alpha: 16
+            dropout: 0.05
+            target_modules: [auto] # auto or explicit names
     pretraining:
         gaze_backbone: /home/elicer/semgaze/weights/gaze360_resnet18.pt # FILL ME
     weights: null # /!\ null (default), or path to a checkpoint (overrides pretraining weights)
@@ -70,7 +76,11 @@ model:
 loss:
     weight_heatmap: 1000
     weight_angular: 3
-    weight_label: 1
+    weight_label: 0
+    label_objective: legacy_infonce # legacy_infonce | global_vocab_ce
+    label_margin_type: none # none, cosface, arcface
+    label_margin: 0.0
+    label_easy_margin: False
     weight_align: 1
 
 # ------------------------------------------------------------------------------------------------------------------- #
@@ -81,7 +91,7 @@ alignment:
     model_name: BAAI/bge-large-en-v1.5
     text_mode: reasoning_only # object_reasoning, reasoning_only, object_only
     feature_dim: 1024
-    layer_index: 1 # 1-based index in decoder transformer depth
+    layer_index: 0 # 1-based index in decoder transformer depth
     loss_type: mse # cosine, mse, infonce
     head_lr_mult: 3.0
     temp_init_value: 0.07 # used when loss_type=infonce
@@ -106,7 +116,7 @@ train:
     matmul_precision: highest # highest (default), high, medium
     precision: bf16-mixed # 64 (double), 32 (full), 16 (16bit mixed), bf16-mixed (bfloat16 mixed). Defaults to 32.
     epochs: 20
-    batch_size: 300
+    batch_size: 256 #300
     accumulate_grad_batches: 1 # 1 (default, no accumulation)
     device: cuda
     resume: False 

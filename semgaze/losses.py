@@ -6,18 +6,78 @@
 # SPDX-License-Identifier: CC-BY-NC-4.0
 #
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def compute_info_nce_loss(emb_pred, emb_gt, io_gt, logit_scale):
+def compute_info_nce_loss_batch_local(emb_pred, emb_gt, io_gt, logit_scale):
+    # Legacy SemGaze behavior: negatives are only unique labels in the current batch.
     mask = io_gt.bool()
     emb_gt, emb_pred = emb_gt[mask], emb_pred[mask]
-    emb_gt, labels = torch.unique(emb_gt, dim=0, return_inverse=True) # get unique labels
+    if emb_pred.numel() == 0:
+        return torch.tensor(0.0, device=emb_pred.device, dtype=emb_pred.dtype)
+    emb_gt, labels = torch.unique(emb_gt, dim=0, return_inverse=True)
     logits = torch.matmul(emb_pred, emb_gt.t()) * logit_scale.exp()
+    return F.cross_entropy(logits, labels)
+
+
+def compute_info_nce_loss_vocab(
+    emb_pred,
+    label_id_gt,
+    io_gt,
+    logit_scale,
+    vocab_emb,
+    margin_type: str = "none",
+    margin: float = 0.0,
+    easy_margin: bool = False,
+):
+    # Use in-frame samples with valid label ids.
+    mask = io_gt.bool() & (label_id_gt >= 0)
+    if torch.sum(mask) == 0:
+        return torch.tensor(0.0, device=emb_pred.device, dtype=emb_pred.dtype)
+
+    emb_pred = F.normalize(emb_pred[mask], p=2, dim=-1)
+    labels = label_id_gt[mask].long()
+    vocab_emb = F.normalize(vocab_emb, p=2, dim=-1).to(emb_pred.device, emb_pred.dtype)
+
+    cosine = torch.matmul(emb_pred, vocab_emb.t())
+    margin_type = str(margin_type).lower()
+
+    if (margin > 0.0) and (margin_type in {"arcface", "cosface"}):
+        one_hot = F.one_hot(labels, num_classes=cosine.size(1)).to(cosine.dtype)
+        if margin_type == "cosface":
+            cosine = cosine - one_hot * margin
+        elif margin_type == "arcface":
+            cos_m = math.cos(margin)
+            sin_m = math.sin(margin)
+            th = math.cos(math.pi - margin)
+            mm = math.sin(math.pi - margin) * margin
+            sine = torch.sqrt((1.0 - cosine.pow(2)).clamp(0.0, 1.0))
+            phi = cosine * cos_m - sine * sin_m
+            if easy_margin:
+                phi = torch.where(cosine > 0.0, phi, cosine)
+            else:
+                phi = torch.where(cosine > th, phi, cosine - mm)
+            cosine = one_hot * phi + (1.0 - one_hot) * cosine
+
+    logits = cosine * logit_scale.exp()
     loss = F.cross_entropy(logits, labels)
     return loss
+
+
+def compute_info_nce_loss(*args, **kwargs):
+    """
+    Backward-compatible wrapper.
+    - Legacy call: compute_info_nce_loss(emb_pred, emb_gt, io_gt, logit_scale)
+    - Vocab call : compute_info_nce_loss(..., vocab_emb=..., ...)
+    """
+    if "vocab_emb" in kwargs:
+        return compute_info_nce_loss_vocab(*args, **kwargs)
+    if len(args) == 4:
+        return compute_info_nce_loss_batch_local(*args)
+    raise TypeError("Unsupported compute_info_nce_loss call signature.")
 
 
 def compute_dist_loss(gp_pred, gp_gt, io_gt):
@@ -29,7 +89,7 @@ def compute_dist_loss(gp_pred, gp_gt, io_gt):
 
 def compute_heatmap_loss(hm_pred, hm_gt, io_gt, loss_fn="mse"):
     if loss_fn == "mse":
-        heatmap_loss = F.mse_loss(hm_pred, hm_gt, reduce=False).mean([1, 2])
+        heatmap_loss = F.mse_loss(hm_pred, hm_gt, reduction="none").mean([1, 2])
     elif loss_fn == "bce":
         heatmap_loss = F.binary_cross_entropy_with_logits(hm_pred, hm_gt, reduction="none").mean([1, 2])
     else:

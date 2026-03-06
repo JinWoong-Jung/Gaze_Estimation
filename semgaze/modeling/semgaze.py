@@ -23,14 +23,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from transformers import get_cosine_schedule_with_warmup, DINOv3ViTModel
+from torch.optim.lr_scheduler import LambdaLR
+from transformers import DINOv3ViTModel
+try:
+    from peft import LoraConfig, TaskType, get_peft_model
+except Exception:
+    LoraConfig = None
+    TaskType = None
+    get_peft_model = None
 
 import torchmetrics as tm
 import pytorch_lightning as pl
 
 from semgaze.modeling.encoder import GazeEncoder, SpatialInputTokenizer, ViTEncoder
 from semgaze.modeling.decoder import GazeDecoder
-from semgaze.losses import compute_heatmap_loss, compute_angular_loss, compute_info_nce_loss, compute_alignment_loss
+from semgaze.losses import (
+    compute_heatmap_loss,
+    compute_angular_loss,
+    compute_info_nce_loss,
+    compute_info_nce_loss_batch_local,
+    compute_alignment_loss,
+)
 from semgaze.metrics import Distance, GFTestAUC, GFTestDistance, MultiAccuracy, GazeAccuracy
 from semgaze.utils.common import spatial_argmax2d, dark_coordinate_decoding
 
@@ -46,12 +59,27 @@ def _cfg_get(cfg, path, default):
     except Exception:
         return default
 
+
+def _get_cosine_schedule_with_warmup_torch(optimizer, num_warmup_steps, num_training_steps):
+    num_warmup_steps = int(max(0, num_warmup_steps))
+    num_training_steps = int(max(1, num_training_steps))
+
+    def lr_lambda(current_step: int):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        progress = min(max(progress, 0.0), 1.0)
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return LambdaLR(optimizer, lr_lambda)
+
 # ==================================================================================================================
 #                                                   SEMGAZE MODULE                                                 #
 # ==================================================================================================================
 class SemGazeModule(pl.LightningModule):
     def __init__(self, cfg):
         super().__init__()
+        self.cfg = cfg
 
         self.model = SemGaze(
             image_size=cfg.model.semgaze.image_size,
@@ -64,8 +92,8 @@ class SemGazeModule(pl.LightningModule):
             decoder_label_emb_dim=512,
             alignment_feature_dim=_cfg_get(cfg, "alignment.feature_dim", 768),
         )
-
-        self.cfg = cfg
+        self.image_encoder_lora_enabled = False
+        self._apply_image_encoder_lora()
         self.feature_map_size = cfg.model.semgaze.image_size // cfg.model.semgaze.patch_size
         
         self.dataset = cfg.experiment.dataset
@@ -103,10 +131,71 @@ class SemGazeModule(pl.LightningModule):
         self.align_layer_index = int(_cfg_get(cfg, "alignment.layer_index", 1))
         self.align_loss_type = str(_cfg_get(cfg, "alignment.loss_type", "cosine")).lower()
         self.align_weight = float(_cfg_get(cfg, "loss.weight_align", 0.0))
+        self.label_objective = str(_cfg_get(cfg, "loss.label_objective", "legacy_infonce")).lower()
+        self.label_margin_type = str(_cfg_get(cfg, "loss.label_margin_type", "none")).lower()
+        self.label_margin = float(_cfg_get(cfg, "loss.label_margin", 0.0))
+        self.label_easy_margin = bool(_cfg_get(cfg, "loss.label_easy_margin", False))
+        self.register_buffer("vocab_emb", torch.empty(0), persistent=False)
+        self.vocab = None
         
         # Initialize Weights
         self._init_weights()
         
+    def _resolve_image_encoder_lora_targets(self, encoder, configured_targets):
+        linear_suffixes = sorted(
+            {name.split(".")[-1] for name, module in encoder.named_modules() if isinstance(module, nn.Linear)}
+        )
+        if isinstance(configured_targets, str):
+            configured_targets = [configured_targets]
+        configured_targets = [str(t) for t in configured_targets]
+
+        if "auto" in configured_targets:
+            preferred = [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "query", "key", "value", "out_proj",
+                "qkv", "proj",
+            ]
+            targets = [name for name in preferred if name in linear_suffixes]
+            if targets:
+                return targets
+            raise ValueError(
+                "Could not auto-resolve image encoder LoRA target modules. "
+                f"Available linear module names: {linear_suffixes[:50]}"
+            )
+
+        targets = [name for name in configured_targets if name in linear_suffixes]
+        if len(targets) == 0:
+            raise ValueError(
+                "Configured image encoder LoRA target_modules do not match any linear modules. "
+                f"Configured={configured_targets}, available={linear_suffixes[:50]}"
+            )
+        return targets
+
+    def _apply_image_encoder_lora(self):
+        enabled = bool(_cfg_get(self.cfg, "model.semgaze.image_encoder_lora.enabled", False))
+        if not enabled:
+            return
+        if get_peft_model is None or LoraConfig is None or TaskType is None:
+            raise ImportError("LoRA is enabled but `peft` is not installed. Install with `pip install peft`.")
+
+        target_modules_cfg = _cfg_get(self.cfg, "model.semgaze.image_encoder_lora.target_modules", ["auto"])
+        target_modules = self._resolve_image_encoder_lora_targets(self.model.encoder, target_modules_cfg)
+        lora_cfg = LoraConfig(
+            r=int(_cfg_get(self.cfg, "model.semgaze.image_encoder_lora.r", 8)),
+            lora_alpha=int(_cfg_get(self.cfg, "model.semgaze.image_encoder_lora.alpha", 16)),
+            lora_dropout=float(_cfg_get(self.cfg, "model.semgaze.image_encoder_lora.dropout", 0.05)),
+            target_modules=target_modules,
+            bias="none",
+            task_type=TaskType.FEATURE_EXTRACTION,
+        )
+        self.model.encoder = get_peft_model(self.model.encoder, lora_cfg)
+        self.image_encoder_lora_enabled = True
+        print(colored(f"Enabled image encoder LoRA (targets={target_modules}).", TERM_COLOR))
+        try:
+            self.model.encoder.print_trainable_parameters()
+        except Exception:
+            pass
+
 
     def _init_weights(self):
         if self.cfg.model.weights is not None:
@@ -159,8 +248,11 @@ class SemGazeModule(pl.LightningModule):
             print(colored(f"Freezing the Image Tokenizer layers.", TERM_COLOR))
             self.freeze_module(self.model.image_tokenizer)
         if self.cfg.train.freeze.image_encoder:
-            print(colored(f"Freezing the Image Encoder layers.", TERM_COLOR))
-            self.freeze_module(self.model.encoder)
+            if self.image_encoder_lora_enabled:
+                print(colored("Image encoder LoRA enabled: keeping adapter params trainable.", TERM_COLOR))
+            else:
+                print(colored(f"Freezing the Image Encoder layers.", TERM_COLOR))
+                self.freeze_module(self.model.encoder)
         if self.cfg.train.freeze.gaze_decoder:
             print(colored(f"Freezing the Gaze Decoder layers.", TERM_COLOR))
             self.freeze_module(self.model.gaze_decoder)
@@ -174,7 +266,8 @@ class SemGazeModule(pl.LightningModule):
         self, 
         gaze_heatmap_gt, 
         gaze_vec_gt, 
-        gaze_label_emb_gt, 
+        gaze_label_emb_gt,
+        gaze_label_id_gt,
         inout_gt, 
         gaze_heatmap_pred, 
         gaze_vec_pred, 
@@ -189,7 +282,22 @@ class SemGazeModule(pl.LightningModule):
 
         if torch.sum(inout_gt) > 0:  # to avoid case where all samples of the batch are outside (i.e. division by 0)
             heatmap_loss = compute_heatmap_loss(gaze_heatmap_pred, gaze_heatmap_gt, inout_gt)
-            label_loss = compute_info_nce_loss(gaze_label_emb_pred, gaze_label_emb_gt, inout_gt, self.logit_scale) 
+            if self.label_objective in {"legacy_infonce", "batch_local_infonce"}:
+                label_loss = compute_info_nce_loss_batch_local(
+                    gaze_label_emb_pred, gaze_label_emb_gt, inout_gt, self.logit_scale
+                )
+            else:
+                self._ensure_vocab_embeddings()
+                label_loss = compute_info_nce_loss(
+                    emb_pred=gaze_label_emb_pred,
+                    label_id_gt=gaze_label_id_gt,
+                    io_gt=inout_gt,
+                    logit_scale=self.logit_scale,
+                    vocab_emb=self.vocab_emb,
+                    margin_type=self.label_margin_type,
+                    margin=self.label_margin,
+                    easy_margin=self.label_easy_margin,
+                )
             angular_loss = compute_angular_loss(gaze_vec_pred, gaze_vec_gt, inout_gt)
         
         total_loss = (
@@ -233,13 +341,15 @@ class SemGazeModule(pl.LightningModule):
         if self.cfg.scheduler.type == "cosine_warmup":
             warmup_steps = self.cfg.scheduler.warmup_epochs * self.num_steps_in_epoch
             max_steps = self.cfg.train.epochs * self.num_steps_in_epoch
-            scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, max_steps)
+            scheduler = _get_cosine_schedule_with_warmup_torch(optimizer, warmup_steps, max_steps)
             scheduler_config = {"scheduler": scheduler, "interval": "step", "frequency": 1}
             return {"optimizer": optimizer, "lr_scheduler": scheduler_config}
         return optimizer
             
                 
     def on_fit_start(self):
+        if self.label_objective not in {"legacy_infonce", "batch_local_infonce"}:
+            self._ensure_vocab_embeddings()
         # Define metrics
         if self.cfg.wandb.log:
             if self.dataset == "gazefollow":
@@ -259,6 +369,32 @@ class SemGazeModule(pl.LightningModule):
             wandb.define_metric('metric/test/acc@1', summary='max')
             wandb.define_metric('metric/test/acc@3', summary='max')
 
+    def _ensure_vocab_embeddings(self):
+        if self.vocab_emb.numel() > 0:
+            return
+        vocab2id_path = os.path.join(self.cfg.project.root, f"data/{self.dataset}/vocab2id.json")
+        with open(vocab2id_path, "r") as f:
+            vocab2id = json.load(f)
+        vocab_size = len(vocab2id)
+        id2vocab = [None] * vocab_size
+        for label, idx in vocab2id.items():
+            idx = int(idx)
+            if idx < 0 or idx >= vocab_size:
+                raise ValueError(f"Invalid vocab id {idx} for label `{label}`.")
+            id2vocab[idx] = label
+        if any(v is None for v in id2vocab):
+            raise ValueError("vocab2id ids are not contiguous from 0..V-1.")
+
+        vocab_emb = []
+        for label in id2vocab:
+            label_emb_path = os.path.join(self.cfg.project.root, f"data/{self.dataset}/label-embeds/{label}-emb.pt")
+            label_emb = torch.load(label_emb_path, map_location="cpu", weights_only=False)
+            label_emb = F.normalize(label_emb.to(torch.float32), p=2, dim=-1)
+            vocab_emb.append(label_emb)
+
+        self.vocab = id2vocab
+        self.vocab_emb = torch.stack(vocab_emb, dim=0).to(self.device)
+
             
     def on_train_epoch_start(self):
         # Set BN layers to eval mode for frozen modules
@@ -269,8 +405,9 @@ class SemGazeModule(pl.LightningModule):
             self.model.image_tokenizer.apply(self._set_batchnorm_eval)
             self.model.image_tokenizer.apply(self._set_dropout_eval)
         if self.cfg.train.freeze.image_encoder:
-            self.model.encoder.apply(self._set_batchnorm_eval)
-            self.model.encoder.apply(self._set_dropout_eval)
+            if not self.image_encoder_lora_enabled:
+                self.model.encoder.apply(self._set_batchnorm_eval)
+                self.model.encoder.apply(self._set_dropout_eval)
         if self.cfg.train.freeze.gaze_decoder:
             self.model.gaze_decoder.apply(self._set_batchnorm_eval)
             self.model.gaze_decoder.apply(self._set_dropout_eval)
@@ -299,7 +436,8 @@ class SemGazeModule(pl.LightningModule):
         loss, logs = self.compute_loss(
             batch["gaze_heatmap"], 
             batch["gaze_vec"], 
-            batch["gaze_label_emb"], 
+            batch["gaze_label_emb"],
+            batch["gaze_label_id"],
             batch["inout"],
             gaze_heatmap_pred, 
             gaze_vec_pred, 
@@ -353,7 +491,8 @@ class SemGazeModule(pl.LightningModule):
         loss, logs = self.compute_loss(
             batch["gaze_heatmap"], 
             batch["gaze_vec"], 
-            batch["gaze_label_emb"], 
+            batch["gaze_label_emb"],
+            batch["gaze_label_id"],
             batch["inout"], 
             gaze_heatmap_pred, 
             gaze_vec_pred, 
@@ -377,21 +516,7 @@ class SemGazeModule(pl.LightningModule):
         
     
     def on_test_start(self):        
-        # Build vocabulary
-        vocab2id_path = os.path.join(self.cfg.project.root, f"data/{self.dataset}/vocab2id.json")
-        with open(vocab2id_path, 'r') as f:
-            vocab2id = json.load(f)
-        self.vocab = sorted(vocab2id.keys())
-        
-        # Load/Compute vocabulary embeddings
-        vocab_emb = []
-        for label in self.vocab:
-            label_emb_path = os.path.join(self.cfg.project.root, f"data/{self.dataset}/label-embeds/{label}-emb.pt")
-            label_emb = torch.load(label_emb_path)
-            vocab_emb.append(label_emb)
-            
-        # Normalize vocabulary embeddings
-        self.vocab_emb = F.normalize(torch.stack(vocab_emb), dim=1).to(self.device)
+        self._ensure_vocab_embeddings()
         
     
     def test_step(self, batch, batch_idx):
@@ -407,7 +532,7 @@ class SemGazeModule(pl.LightningModule):
         gaze_heatmap_pred = gaze_heatmap_pred[:, -1, ...]  # (b, 1, 64, 64) >> (b, 64, 64) / select last person
         gaze_pt_pred = dark_coordinate_decoding(gaze_heatmap_pred, kernel_size=self.cfg.data.heatmap_sigma * 3, normalize=True)       
         gaze_label_emb_pred = gaze_label_emb_pred[:, -1, ...] # (b, n, 512) >> (b, 512)
-        gaze_label_logit_pred = gaze_label_emb_pred @ self.vocab_emb.T # (b, vocab_size)
+        gaze_label_logit_pred = gaze_label_emb_pred @ self.vocab_emb.T * self.logit_scale.exp() # (b, vocab_size)
             
         # Logging dataset-specific metrics
         if self.dataset == "gazefollow":
@@ -489,7 +614,7 @@ class SemGaze(nn.Module):
         gaze_tokens, gaze_vec = self.gaze_encoder(sample["heads"], sample["head_bboxes"])  # (b, n, d), (b, n, 2)
         
         # Encode Image =====================================================
-        image_tokens = self.encoder(sample["image"]).last_hidden_state  # (b, t+1, d)
+        image_tokens = self.encoder(pixel_values=sample["image"]).last_hidden_state  # (b, t+1, d)
         image_tokens = image_tokens[:, (1 + self.encoder.config.num_register_tokens):, :] # (b, t, d), remove cls token and register tokens
         b, t, d = image_tokens.shape
         

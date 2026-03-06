@@ -233,8 +233,11 @@ class GazeFollowDataset(Dataset):
             gaze_pt = torch.tensor([item["gaze_x"], item["gaze_y"]], dtype=torch.float)
             gaze_label = item["gaze_pseudo_label"]
             gaze_labels = [gaze_label]
-            gaze_label_id = torch.tensor(item["label_id"])
-            gaze_label_ids = torch.tensor([gaze_label_id])
+            if pd.isnull(gaze_label):
+                gaze_label_id = torch.tensor(-1, dtype=torch.long)
+            else:
+                gaze_label_id = torch.tensor(int(self.vocab2id.get(gaze_label, -1)), dtype=torch.long)
+            gaze_label_ids = torch.tensor([int(gaze_label_id.item())], dtype=torch.long)
             idx = item["id"]
         elif self.split == "test":
             image_path = self.image_paths[index]
@@ -246,10 +249,17 @@ class GazeFollowDataset(Dataset):
             item = p_annotations.iloc[0]
             gaze_label = item.gaze_gt_label
             gaze_labels = item.gaze_gt_labels
-            gaze_label_id = torch.tensor(item.test_label_id)
-            gaze_label_ids = torch.tensor([gaze_label_id])
-            if gaze_label_id != -1:
-                gaze_label_ids = torch.tensor([self.vocab2id[label] for label in gaze_labels.split('-')])
+            if pd.isnull(gaze_label):
+                gaze_label_id = torch.tensor(-1, dtype=torch.long)
+            else:
+                gaze_label_id = torch.tensor(int(self.vocab2id.get(gaze_label, -1)), dtype=torch.long)
+            gaze_label_ids_list = [int(gaze_label_id.item())]
+            if (not pd.isnull(gaze_labels)) and (int(gaze_label_id.item()) != -1):
+                parsed_ids = [int(self.vocab2id.get(label, -1)) for label in str(gaze_labels).split("-")]
+                parsed_ids = [x for x in parsed_ids if x >= 0]
+                if len(parsed_ids) > 0:
+                    gaze_label_ids_list = parsed_ids
+            gaze_label_ids = torch.tensor(gaze_label_ids_list, dtype=torch.long)
             l = 5 - len(gaze_label_ids)
             gaze_label_ids = F.pad(gaze_label_ids, (0, l), value=-1)
 

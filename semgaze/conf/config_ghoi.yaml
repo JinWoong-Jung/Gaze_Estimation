@@ -59,6 +59,12 @@ model:
         decoder_depth: 2
         decoder_num_heads: 8
         temp_init_value: 0.07
+        image_encoder_lora:
+            enabled: False
+            r: 8
+            alpha: 16
+            dropout: 0.05
+            target_modules: [auto] # auto or explicit names
     pretraining:
         gaze_backbone: /home/elicer/semgaze/weights/gaze360_resnet18.pt # FILL ME
         image_encoder: /home/elicer/semgaze/weights/multimae-b_98_rgb+-depth-semseg_1600e_multivit-afff3f8c.pth # FILL ME
@@ -69,6 +75,10 @@ loss:
     weight_heatmap: 1000
     weight_angular: 3
     weight_label: 1
+    label_objective: legacy_infonce # legacy_infonce | global_vocab_ce
+    label_margin_type: none # none, cosface, arcface
+    label_margin: 0.0
+    label_easy_margin: False
 
 # ------------------------------------------------------------------------------------------------------------------- #
 

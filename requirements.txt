@@ -8,6 +8,7 @@ omegaconf==2.3.0
 openai==2.16.0
 opencv_python==4.11.0.86
 pandas==3.0.0
+peft==0.17.0
 Pillow==12.1.0
 pytorch_lightning==2.5.0.post0
 termcolor==3.3.0
