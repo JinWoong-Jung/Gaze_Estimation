@@ -20,3 +20,5 @@ logs/
 wandb/
 .hydra/
 .vscode/
+
+lightning_logs/

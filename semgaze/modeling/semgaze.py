@@ -80,13 +80,33 @@ class SemGazeModule(pl.LightningModule):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self.image_encoder_name = str(
+            _cfg_get(
+                cfg,
+                "model.semgaze.image_encoder.name",
+                _cfg_get(cfg, "model.semgaze.image_encoder_name", "facebook/dinov3-vitb16-pretrain-lvd1689m"),
+            )
+        )
+        self.image_encoder_freeze = bool(
+            _cfg_get(
+                cfg,
+                "model.semgaze.image_encoder.freeze",
+                _cfg_get(cfg, "train.freeze.image_encoder", False),
+            )
+        )
+        self.image_encoder_unfreeze_last_n_blocks = max(
+            0,
+            int(_cfg_get(cfg, "model.semgaze.image_encoder.unfreeze_last_n_blocks", 0)),
+        )
+        self.test_tta_enabled = bool(_cfg_get(cfg, "test.tta.enabled", False))
+        self.test_tta_hflip = bool(_cfg_get(cfg, "test.tta.hflip", True))
 
         self.model = SemGaze(
             image_size=cfg.model.semgaze.image_size,
             patch_size=cfg.model.semgaze.patch_size, 
             token_dim=cfg.model.semgaze.token_dim, 
             gaze_vec_dim=cfg.model.semgaze.gaze_vec_dim, 
-            image_encoder_name=cfg.model.semgaze.image_encoder_name,
+            image_encoder_name=self.image_encoder_name,
             decoder_depth=cfg.model.semgaze.decoder_depth, 
             decoder_num_heads=cfg.model.semgaze.decoder_num_heads, 
             decoder_label_emb_dim=512,
@@ -172,18 +192,46 @@ class SemGazeModule(pl.LightningModule):
         return targets
 
     def _apply_image_encoder_lora(self):
-        enabled = bool(_cfg_get(self.cfg, "model.semgaze.image_encoder_lora.enabled", False))
+        enabled = bool(
+            _cfg_get(
+                self.cfg,
+                "model.semgaze.image_encoder.lora.enabled",
+                _cfg_get(self.cfg, "model.semgaze.image_encoder_lora.enabled", False),
+            )
+        )
         if not enabled:
             return
         if get_peft_model is None or LoraConfig is None or TaskType is None:
             raise ImportError("LoRA is enabled but `peft` is not installed. Install with `pip install peft`.")
 
-        target_modules_cfg = _cfg_get(self.cfg, "model.semgaze.image_encoder_lora.target_modules", ["auto"])
+        target_modules_cfg = _cfg_get(
+            self.cfg,
+            "model.semgaze.image_encoder.lora.target_modules",
+            _cfg_get(self.cfg, "model.semgaze.image_encoder_lora.target_modules", ["auto"]),
+        )
         target_modules = self._resolve_image_encoder_lora_targets(self.model.encoder, target_modules_cfg)
         lora_cfg = LoraConfig(
-            r=int(_cfg_get(self.cfg, "model.semgaze.image_encoder_lora.r", 8)),
-            lora_alpha=int(_cfg_get(self.cfg, "model.semgaze.image_encoder_lora.alpha", 16)),
-            lora_dropout=float(_cfg_get(self.cfg, "model.semgaze.image_encoder_lora.dropout", 0.05)),
+            r=int(
+                _cfg_get(
+                    self.cfg,
+                    "model.semgaze.image_encoder.lora.r",
+                    _cfg_get(self.cfg, "model.semgaze.image_encoder_lora.r", 8),
+                )
+            ),
+            lora_alpha=int(
+                _cfg_get(
+                    self.cfg,
+                    "model.semgaze.image_encoder.lora.alpha",
+                    _cfg_get(self.cfg, "model.semgaze.image_encoder_lora.alpha", 16),
+                )
+            ),
+            lora_dropout=float(
+                _cfg_get(
+                    self.cfg,
+                    "model.semgaze.image_encoder.lora.dropout",
+                    _cfg_get(self.cfg, "model.semgaze.image_encoder_lora.dropout", 0.05),
+                )
+            ),
             target_modules=target_modules,
             bias="none",
             task_type=TaskType.FEATURE_EXTRACTION,
@@ -239,6 +287,38 @@ class SemGazeModule(pl.LightningModule):
         for param in module.parameters():
             param.requires_grad = False
 
+    def _get_image_encoder_blocks(self):
+        candidates = []
+        for name, module in self.model.encoder.named_modules():
+            if not isinstance(module, nn.ModuleList):
+                continue
+            if len(module) == 0:
+                continue
+            if name.split(".")[-1] not in {"layer", "layers", "blocks"}:
+                continue
+            candidates.append((name, module))
+
+        if len(candidates) == 0:
+            return []
+
+        candidates.sort(key=lambda x: (len(x[1]), x[0].count(".")), reverse=True)
+        return list(candidates[0][1])
+
+    def _unfreeze_image_encoder_last_blocks(self, num_blocks: int):
+        if num_blocks <= 0:
+            return
+
+        blocks = self._get_image_encoder_blocks()
+        if len(blocks) == 0:
+            print(colored("Could not locate image encoder transformer blocks. Skipping partial unfreeze.", TERM_COLOR))
+            return
+
+        num_to_unfreeze = min(num_blocks, len(blocks))
+        for block in blocks[-num_to_unfreeze:]:
+            for param in block.parameters():
+                param.requires_grad = True
+        print(colored(f"Unfroze last {num_to_unfreeze}/{len(blocks)} image encoder blocks.", TERM_COLOR))
+
             
     def freeze(self):
         if self.cfg.train.freeze.gaze_encoder:
@@ -247,12 +327,14 @@ class SemGazeModule(pl.LightningModule):
         if self.cfg.train.freeze.image_tokenizer:
             print(colored(f"Freezing the Image Tokenizer layers.", TERM_COLOR))
             self.freeze_module(self.model.image_tokenizer)
-        if self.cfg.train.freeze.image_encoder:
+        if self.image_encoder_freeze:
             if self.image_encoder_lora_enabled:
                 print(colored("Image encoder LoRA enabled: keeping adapter params trainable.", TERM_COLOR))
             else:
                 print(colored(f"Freezing the Image Encoder layers.", TERM_COLOR))
                 self.freeze_module(self.model.encoder)
+            if self.image_encoder_unfreeze_last_n_blocks > 0:
+                self._unfreeze_image_encoder_last_blocks(self.image_encoder_unfreeze_last_n_blocks)
         if self.cfg.train.freeze.gaze_decoder:
             print(colored(f"Freezing the Gaze Decoder layers.", TERM_COLOR))
             self.freeze_module(self.model.gaze_decoder)
@@ -260,6 +342,30 @@ class SemGazeModule(pl.LightningModule):
 
     def forward(self, batch, return_alignment=False):
         return self.model(batch, return_alignment=return_alignment, align_layer_index=self.align_layer_index)
+
+    def _build_hflip_batch(self, batch):
+        batch_flip = dict(batch)
+        batch_flip["image"] = torch.flip(batch["image"], dims=[-1])
+
+        if "heads" in batch and torch.is_tensor(batch["heads"]):
+            batch_flip["heads"] = torch.flip(batch["heads"], dims=[-1])
+
+        if "head_bboxes" in batch and torch.is_tensor(batch["head_bboxes"]):
+            head_bboxes = batch["head_bboxes"].clone()
+            head_bboxes[..., [0, 2]] = 1.0 - head_bboxes[..., [2, 0]]
+            batch_flip["head_bboxes"] = head_bboxes
+        return batch_flip
+
+    def _forward_test(self, batch):
+        gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self(batch, return_alignment=False)
+        if not (self.test_tta_enabled and self.test_tta_hflip):
+            return gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred
+
+        batch_flip = self._build_hflip_batch(batch)
+        gaze_heatmap_pred_flip, _, _ = self(batch_flip, return_alignment=False)
+        gaze_heatmap_pred_flip = torch.flip(gaze_heatmap_pred_flip, dims=[-1])
+        gaze_heatmap_pred = 0.5 * (gaze_heatmap_pred + gaze_heatmap_pred_flip)
+        return gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred
         
     
     def compute_loss(
@@ -404,8 +510,8 @@ class SemGazeModule(pl.LightningModule):
         if self.cfg.train.freeze.image_tokenizer:
             self.model.image_tokenizer.apply(self._set_batchnorm_eval)
             self.model.image_tokenizer.apply(self._set_dropout_eval)
-        if self.cfg.train.freeze.image_encoder:
-            if not self.image_encoder_lora_enabled:
+        if self.image_encoder_freeze:
+            if (not self.image_encoder_lora_enabled) and (self.image_encoder_unfreeze_last_n_blocks <= 0):
                 self.model.encoder.apply(self._set_batchnorm_eval)
                 self.model.encoder.apply(self._set_dropout_eval)
         if self.cfg.train.freeze.gaze_decoder:
@@ -528,7 +634,7 @@ class SemGazeModule(pl.LightningModule):
         vocab_size = self.vocab_emb.size(0)
                 
         # Forward pass
-        gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self(batch, return_alignment=False)
+        gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self._forward_test(batch)
         gaze_heatmap_pred = gaze_heatmap_pred[:, -1, ...]  # (b, 1, 64, 64) >> (b, 64, 64) / select last person
         gaze_pt_pred = dark_coordinate_decoding(gaze_heatmap_pred, kernel_size=self.cfg.data.heatmap_sigma * 3, normalize=True)       
         gaze_label_emb_pred = gaze_label_emb_pred[:, -1, ...] # (b, n, 512) >> (b, 512)
@@ -537,7 +643,7 @@ class SemGazeModule(pl.LightningModule):
         # Logging dataset-specific metrics
         if self.dataset == "gazefollow":
             test_dist_to_avg, test_avg_dist, test_min_dist = self.metrics["test_dist"](gaze_pt_pred, batch["gaze_pt"])
-            self.metrics["test_auc"].update(gaze_heatmap_pred, batch["gaze_pt"])
+            self.metrics["test_auc"].update(gaze_heatmap_pred, batch["gaze_pt"], batch["img_size"])
             self.metrics["test_multi_acc@1"].update(gaze_label_logit_pred, batch["gaze_label_ids"])
             
             self.log("metric/test/auc", self.metrics["test_auc"], batch_size=n, prog_bar=True, on_step=False, on_epoch=True)

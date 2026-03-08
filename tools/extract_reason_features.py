@@ -256,10 +256,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--text_mode",
         type=str,
-        default="reasoning_only",
+        default="object_reasoning",
         choices=["object_reasoning", "object_only", "reasoning_only"],
     )
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--device", type=str, default="cuda", help="auto, cuda, cpu")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing feature files")

@@ -7,6 +7,7 @@
 #
 
 import torch
+import torch.nn.functional as F
 import torchmetrics as tm
 from torchmetrics.functional.classification.auroc import binary_auroc
 
@@ -92,15 +93,32 @@ class GFTestAUC(tm.Metric):
         self,
         gaze_heatmap_pred: torch.Tensor,
         gaze_pt: torch.Tensor,
+        img_size: torch.Tensor,
     ):
-        size = gaze_heatmap_pred.shape[1:]  # (b, h, w) >> (h, w)
-        for hm_pred, gp_gt in zip(gaze_heatmap_pred, gaze_pt):
+        for hm_pred, gp_gt, img_wh in zip(gaze_heatmap_pred, gaze_pt, img_size):
             gp_gt = gp_gt[gp_gt[:, 0] != -1]  # discard invalid gaze points
-            hm_gt_binary = generate_binary_gaze_heatmap(gp_gt, size=size)
+            if gp_gt.numel() == 0:
+                continue
+
+            img_w = int(img_wh[0].item())
+            img_h = int(img_wh[1].item())
+            if (img_w <= 0) or (img_h <= 0):
+                continue
+
+            hm_pred = F.interpolate(
+                hm_pred.unsqueeze(0).unsqueeze(0),
+                size=(img_h, img_w),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0).squeeze(0)
+
+            hm_gt_binary = generate_binary_gaze_heatmap(gp_gt, size=(img_h, img_w))
             self.sum_auc += binary_auroc(hm_pred, hm_gt_binary)
-        self.num_obs += len(gaze_heatmap_pred)
+            self.num_obs += 1
 
     def compute(self):
+        if self.num_obs == 0:
+            return torch.tensor(0.0, device=self.device)
         auc = self.sum_auc / self.num_obs
         return auc
 
