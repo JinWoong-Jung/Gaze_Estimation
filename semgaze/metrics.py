@@ -9,7 +9,7 @@
 import torch
 import torch.nn.functional as F
 import torchmetrics as tm
-from torchmetrics.functional.classification.auroc import binary_auroc
+from sklearn.metrics import roc_auc_score
 
 from semgaze.utils.common import generate_binary_gaze_heatmap, is_point_in_box
 
@@ -113,7 +113,16 @@ class GFTestAUC(tm.Metric):
             ).squeeze(0).squeeze(0)
 
             hm_gt_binary = generate_binary_gaze_heatmap(gp_gt, size=(img_h, img_w))
-            self.sum_auc += binary_auroc(hm_pred, hm_gt_binary)
+            try:
+                auc = roc_auc_score(
+                    hm_gt_binary.detach().cpu().flatten().numpy(),
+                    hm_pred.detach().cpu().flatten().numpy(),
+                )
+            except ValueError:
+                # Skip degenerate edge-cases where ROC AUC is undefined.
+                continue
+
+            self.sum_auc += torch.tensor(float(auc), device=self.device)
             self.num_obs += 1
 
     def compute(self):

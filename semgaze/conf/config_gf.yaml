@@ -20,27 +20,24 @@ project:
 # ------------------------------------------------------------------------------------------------------------------- #
 
 experiment:
-    name: test(ViT, all available except LoRA, recog,) # name of the wandb job
+    name: align = {reasoning, object}, ViT-L, no LoRA, image_size=224 # name of the wandb job
     group: null # name of the wandb group
     task: train+test # combination of {train, val, test} separated by '+' sign
     dataset: gazefollow # gazefollow, gazehoi
-    path: ${hydra:runtime.cwd} # to retrieve logs and checkpoints
 
 # ------------------------------------------------------------------------------------------------------------------- #
 
 data:
     num_people: 1 # int or -1 to include all people
-    image_size: 256 # 224 -> 256
-    heatmap_size: 64 # 56 -> 64
+    image_size: 256 # 256
+    heatmap_size: 64 # 64
     heatmap_sigma: 3
     return_head_mask: False
     gf:
         root: /home/elicer/semgaze/data/gazefollow_extended # FILL ME
-        root_annotations: /home/elicer/semgaze/data/gazefollow_extended # FILL ME
         root_heads: /home/elicer/semgaze/data/GazeFollow-head # FILL ME (if needed)
-        reason_txt_root: /home/elicer/semgaze/data/bucket_data/data/gazefollow_reason/output
-        reason_feature_root: /home/elicer/semgaze/data/gazefollow_reason/features/reasoning_only
-        reason_feature_preload: False
+        reasoning_feature_root: /home/elicer/semgaze/data/gazefollow_reason/features/reasoning_only
+        object_feature_root: /home/elicer/semgaze/data/gazefollow_reason/features/object_only
         num_train_samples: 108955
         vocab_size: 346
     gazehoi:
@@ -54,11 +51,11 @@ data:
 model:
     semgaze:
         patch_size: 16
-        token_dim: 768 # ViT-L/16: 1024, ViT-B/16: 768
+        token_dim: 768 # Decoder token dim (image encoder output is projected to this dim)
         image_size: ${data.image_size}
         gaze_vec_dim: 2
         image_encoder:
-            name: facebook/dinov3-vitb16-pretrain-lvd1689m # facebook/dinov3-vitl16-pretrain-lvd1689m or facebook/dinov3-vitb16-pretrain-lvd1689m
+            name: facebook/dinov3-vitl16-pretrain-lvd1689m # facebook/dinov3-vitl16-pretrain-lvd1689m or facebook/dinov3-vitb16-pretrain-lvd1689m
             freeze: True
             unfreeze_last_n_blocks: 0
             lora:
@@ -80,25 +77,34 @@ loss:
     weight_heatmap: 1000
     weight_angular: 3 # 3
     weight_label: 1 # 1
-    label_objective: legacy_infonce # legacy_infonce | global_vocab_ce
+    label_objective: global_vocab_ce # legacy_infonce | global_vocab_ce
     label_margin_type: none # none, cosface, arcface
     label_margin: 0.0
     label_easy_margin: False
-    weight_align: 0 #0.1 #0.1
+    weight_align_reasoning: 0.5 # reasoning-only alignment loss weight
+    weight_align_object: 0.5 # object-only alignment loss weight
 
 # ------------------------------------------------------------------------------------------------------------------- #
 
-alignment:
-    enabled: False
+alignment_reasoning:
+    enabled: True
     train_only: True
-    model_name: BAAI/bge-large-en-v1.5
-    text_mode: reasoning_only # object_reasoning, reasoning_only, object_only
+    head_type: mlp # mlp | projection
     feature_dim: 1024
-    layer_index: 0 # 1-based index in decoder transformer depth
+    layer_index: 1 # 1-based index in decoder transformer depth
     loss_type: infonce # cosine, mse, infonce
     head_lr_mult: 3.0
     temp_init_value: 0.07 # used when loss_type=infonce
-    reason_log_limit: 20
+    reasoning_log_limit: 20
+
+alignment_object:
+    enabled: True
+    train_only: True
+    head_type: mlp # mlp | projection
+    feature_dim: 1024
+    loss_type: infonce # cosine, mse, infonce
+    head_lr_mult: 3.0
+    temp_init_value: 0.07 # used when loss_type=infonce
 
 # ------------------------------------------------------------------------------------------------------------------- #
 
@@ -130,7 +136,6 @@ train:
     freeze:
         gaze_encoder: False 
         image_tokenizer: False
-        image_encoder: False # deprecated path, use model.semgaze.image_encoder.freeze
         gaze_decoder: False
     swa:
         use: True
@@ -149,10 +154,10 @@ val:
 
 test:
     checkpoint: null
-    batch_size: 128
+    batch_size: 64
     device: ${train.device}
     tta:
-        enabled: True
+        enabled: False
         hflip: True
 
 # ------------------------------------------------------------------------------------------------------------------- #

@@ -102,6 +102,7 @@ class GazeHOIDataset(Dataset):
         obj_bbox = torch.from_numpy(obj_bbox.values.astype(np.float32))
         obj_w, obj_h = obj_bbox[2] - obj_bbox[0], obj_bbox[3] - obj_bbox[1]
         obj_bbox /= torch.tensor([img_w, img_h, img_w, img_h], dtype=torch.float)
+        obj_bbox = torch.clamp(obj_bbox, min=0.0, max=1.0)
 
         # Load pid, inout, gaze point and gaze label
         pid = item["pair_id"]
@@ -120,6 +121,7 @@ class GazeHOIDataset(Dataset):
             if (obj_bbox[0] <= gaze_pt_pred[0] <= obj_bbox[2]) and (obj_bbox[1] <= gaze_pt_pred[1] <= obj_bbox[3]) and \
             max(obj_w, obj_h) / min(img_w, img_h) >= 0.3: 
                 gaze_pt = gaze_pt_pred
+        gaze_pt = torch.clamp(gaze_pt, min=0.0, max=1.0)
 
         # Load head bboxes
         ## For target person
@@ -216,15 +218,23 @@ class GazeHOIDataset(Dataset):
         )
         
         # Generate gaze heatmap
-        try:
-            sample["gaze_heatmap"] = generate_gaze_heatmap(sample["gaze_pt"], sigma=self.heatmap_sigma, size=self.heatmap_size)
-        except Exception as e:
-            print(f"Path: {sample['path']}")
-            print(f"Gaze point: {sample['gaze_pt']}")
-            print(f"Error generating gaze heatmap: {e}")
-            import sys
-            sys.stdout.flush()  # 👈 force the buffer to flush
-            raise e
+        # Follow the same in/out handling used in gazefollow:
+        # when transform marks a sample as out-of-frame (inout=0),
+        # keep a zero heatmap and avoid generating from invalid gaze points.
+        if sample["inout"] == 1.0:
+            try:
+                sample["gaze_heatmap"] = generate_gaze_heatmap(
+                    sample["gaze_pt"], sigma=self.heatmap_sigma, size=self.heatmap_size
+                )
+            except Exception as e:
+                print(f"Path: {sample['path']}")
+                print(f"Gaze point: {sample['gaze_pt']}")
+                print(f"Error generating gaze heatmap: {e}")
+                import sys
+                sys.stdout.flush()  # 👈 force the buffer to flush
+                raise e
+        else:
+            sample["gaze_heatmap"] = torch.zeros((self.heatmap_size, self.heatmap_size), dtype=torch.float)
         
         # Compute gaze vec
         new_img_w, new_img_h = get_img_size(sample["image"])

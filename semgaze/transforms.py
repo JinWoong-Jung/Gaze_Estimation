@@ -241,16 +241,21 @@ class RandomCropSafeGaze(object):
                                 gaze_pt_px[1] < crop_ymin or gaze_pt_px[1] >= crop_ymin + crop_h)
             
             if gaze_outside_crop:
-                print('INSIDE IF BLOCK TO CONVERT INOUT FROM 1 TO 0')
-                print(f"gaze_pt_px: {gaze_pt_px}")
-                print(f"gaze_pt_px: {sample['head_bboxes']}")
-                print(f"(img_w, img_h): ({img_w}, {img_h})")
-                print(f"(crop_xmin, crop_ymin): ({crop_xmin}, {crop_ymin})")
-                print(f"(crop_w, crop_h): ({crop_w}, {crop_h})")
+                # print('INSIDE IF BLOCK TO CONVERT INOUT FROM 1 TO 0')
+                # print(f"gaze_pt_px: {gaze_pt_px}")
+                # print(f"gaze_pt_px: {sample['head_bboxes']}")
+                # print(f"(img_w, img_h): ({img_w}, {img_h})")
+                # print(f"(crop_xmin, crop_ymin): ({crop_xmin}, {crop_ymin})")
+                # print(f"(crop_w, crop_h): ({crop_w}, {crop_h})")
                 
                 sample["inout"] = 1. - sample["inout"]
                 sample["gaze_pt"] = torch.tensor([-1., -1.], dtype=torch.float)
-                if "reason_valid" in sample:
+                if "reasoning_valid" in sample:
+                    if torch.is_tensor(sample["reasoning_valid"]):
+                        sample["reasoning_valid"] = torch.zeros_like(sample["reasoning_valid"], dtype=torch.float32)
+                    else:
+                        sample["reasoning_valid"] = 0.0
+                elif "reason_valid" in sample:
                     if torch.is_tensor(sample["reason_valid"]):
                         sample["reason_valid"] = torch.zeros_like(sample["reason_valid"], dtype=torch.float32)
                     else:

@@ -429,14 +429,20 @@ def generate_binary_gaze_heatmap(gaze_point, size=(64, 64)):
     assert gaze_point.ndim <= 2, f"Gaze point must be 1D or 2D, but found {gaze_point.ndim}D."
 
     height, width = size
-    gaze_point = gaze_point * (torch.tensor((width, height), device=gaze_point.device) - 1)
+    # Match GazeFollow/Gazelle evaluation rule:
+    #   pixel_x = int(gaze_x * width), pixel_y = int(gaze_y * height), then clamp to image bounds.
+    gaze_point = gaze_point * torch.tensor((width, height), device=gaze_point.device)
     gaze_point = gaze_point.int()
+    gaze_point[..., 0] = torch.clamp(gaze_point[..., 0], max=width - 1)
+    gaze_point[..., 1] = torch.clamp(gaze_point[..., 1], max=height - 1)
     binary_heatmap = torch.zeros((height, width), device=gaze_point.device, dtype=torch.int)
 
     if gaze_point.ndim == 1:
-        binary_heatmap[gaze_point[1], gaze_point[0]] = 1
+        if (gaze_point[0] >= 0) and (gaze_point[1] >= 0):
+            binary_heatmap[gaze_point[1], gaze_point[0]] = 1
     elif gaze_point.ndim == 2:  # gazefollow
         for gp in gaze_point:
-            binary_heatmap[gp[1], gp[0]] = 1
+            if (gp[0] >= 0) and (gp[1] >= 0):
+                binary_heatmap[gp[1], gp[0]] = 1
 
     return binary_heatmap

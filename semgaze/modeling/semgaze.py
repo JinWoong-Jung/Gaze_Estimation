@@ -15,6 +15,7 @@ import json
 from termcolor import colored
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple, Type, Union
+import omegaconf
 
 import wandb
 import pandas as pd
@@ -80,6 +81,13 @@ class SemGazeModule(pl.LightningModule):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        # Persist full resolved runtime config into checkpoints so eval-only runs
+        # can rebuild the exact training-time architecture/configuration.
+        try:
+            cfg_serialized = omegaconf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=False)
+            self.save_hyperparameters({"cfg": cfg_serialized})
+        except Exception as exc:
+            print(colored(f"Warning: failed to serialize cfg into checkpoint hyper_parameters ({exc}).", TERM_COLOR))
         self.image_encoder_name = str(
             _cfg_get(
                 cfg,
@@ -110,7 +118,28 @@ class SemGazeModule(pl.LightningModule):
             decoder_depth=cfg.model.semgaze.decoder_depth, 
             decoder_num_heads=cfg.model.semgaze.decoder_num_heads, 
             decoder_label_emb_dim=512,
-            alignment_feature_dim=_cfg_get(cfg, "alignment.feature_dim", 768),
+            alignment_feature_dim=_cfg_get(
+                cfg, "alignment_reasoning.feature_dim", _cfg_get(cfg, "alignment.feature_dim", 768)
+            ),
+            object_alignment_feature_dim=_cfg_get(
+                cfg,
+                "alignment_object.feature_dim",
+                _cfg_get(cfg, "alignment_reasoning.feature_dim", _cfg_get(cfg, "alignment.feature_dim", 768)),
+            ),
+            reasoning_alignment_head_type=str(
+                _cfg_get(cfg, "alignment_reasoning.head_type", _cfg_get(cfg, "alignment.head_type", "mlp"))
+            ).lower(),
+            object_alignment_head_type=str(
+                _cfg_get(
+                    cfg,
+                    "alignment_object.head_type",
+                    _cfg_get(
+                        cfg,
+                        "alignment_reasoning.head_type",
+                        _cfg_get(cfg, "alignment.head_type", "mlp"),
+                    ),
+                )
+            ).lower(),
         )
         self.image_encoder_lora_enabled = False
         self._apply_image_encoder_lora()
@@ -145,16 +174,75 @@ class SemGazeModule(pl.LightningModule):
 
         # Define logit scale parameter for loss computation
         self.logit_scale = nn.Parameter(torch.log(torch.tensor(1 / cfg.model.semgaze.temp_init_value)))
-        self.align_logit_scale = nn.Parameter(torch.log(torch.tensor(1 / _cfg_get(cfg, "alignment.temp_init_value", 0.07))))
-        self.align_enabled = bool(_cfg_get(cfg, "alignment.enabled", False))
-        self.align_train_only = bool(_cfg_get(cfg, "alignment.train_only", True))
-        self.align_layer_index = int(_cfg_get(cfg, "alignment.layer_index", 1))
-        self.align_loss_type = str(_cfg_get(cfg, "alignment.loss_type", "cosine")).lower()
-        self.align_weight = float(_cfg_get(cfg, "loss.weight_align", 0.0))
+        self.align_logit_scale = nn.Parameter(
+            torch.log(
+                torch.tensor(
+                    1
+                    / _cfg_get(
+                        cfg,
+                        "alignment_reasoning.temp_init_value",
+                        _cfg_get(cfg, "alignment.temp_init_value", 0.07),
+                    )
+                )
+            )
+        )
+        self.object_align_logit_scale = nn.Parameter(
+            torch.log(
+                torch.tensor(
+                    1
+                    / _cfg_get(
+                        cfg,
+                        "alignment_object.temp_init_value",
+                        _cfg_get(
+                            cfg,
+                            "alignment_reasoning.temp_init_value",
+                            _cfg_get(cfg, "alignment.temp_init_value", 0.07),
+                        ),
+                    )
+                )
+            )
+        )
+        self.align_enabled = bool(_cfg_get(cfg, "alignment_reasoning.enabled", _cfg_get(cfg, "alignment.enabled", False)))
+        self.align_train_only = bool(
+            _cfg_get(cfg, "alignment_reasoning.train_only", _cfg_get(cfg, "alignment.train_only", True))
+        )
+        self.align_layer_index = int(
+            _cfg_get(cfg, "alignment_reasoning.layer_index", _cfg_get(cfg, "alignment.layer_index", 1))
+        )
+        self.align_loss_type = str(
+            _cfg_get(cfg, "alignment_reasoning.loss_type", _cfg_get(cfg, "alignment.loss_type", "cosine"))
+        ).lower()
+        self.align_weight = float(_cfg_get(cfg, "loss.weight_align_reasoning", _cfg_get(cfg, "loss.weight_align", 0.0)))
+        self.object_align_enabled = bool(_cfg_get(cfg, "alignment_object.enabled", False))
+        self.object_align_train_only = bool(_cfg_get(cfg, "alignment_object.train_only", True))
+        self.object_align_loss_type = str(
+            _cfg_get(
+                cfg,
+                "alignment_object.loss_type",
+                _cfg_get(cfg, "alignment_reasoning.loss_type", _cfg_get(cfg, "alignment.loss_type", "cosine")),
+            )
+        ).lower()
+        self.object_align_weight = float(_cfg_get(cfg, "loss.weight_align_object", 0.0))
         self.label_objective = str(_cfg_get(cfg, "loss.label_objective", "legacy_infonce")).lower()
         self.label_margin_type = str(_cfg_get(cfg, "loss.label_margin_type", "none")).lower()
         self.label_margin = float(_cfg_get(cfg, "loss.label_margin", 0.0))
         self.label_easy_margin = bool(_cfg_get(cfg, "loss.label_easy_margin", False))
+        self.out_of_frame_log_enabled = bool(
+            _cfg_get(cfg, "train.out_of_frame_logging.enabled", self.dataset == "gazehoi")
+        )
+        self.out_of_frame_log_dir = str(
+            _cfg_get(
+                cfg,
+                "train.out_of_frame_logging.dir",
+                os.path.join(cfg.project.root, "logs", "gazehoi_out_of_frame"),
+            )
+        )
+        self.out_of_frame_log_max_paths = int(
+            _cfg_get(cfg, "train.out_of_frame_logging.max_paths_per_epoch", 500)
+        )
+        self._oof_epoch_count = 0
+        self._oof_epoch_total = 0
+        self._oof_epoch_paths = []
         self.register_buffer("vocab_emb", torch.empty(0), persistent=False)
         self.vocab = None
         
@@ -340,8 +428,13 @@ class SemGazeModule(pl.LightningModule):
             self.freeze_module(self.model.gaze_decoder)
 
 
-    def forward(self, batch, return_alignment=False):
-        return self.model(batch, return_alignment=return_alignment, align_layer_index=self.align_layer_index)
+    def forward(self, batch, return_alignment=False, return_object_alignment=False):
+        return self.model(
+            batch,
+            return_alignment=return_alignment,
+            align_layer_index=self.align_layer_index,
+            return_object_alignment=return_object_alignment,
+        )
 
     def _build_hflip_batch(self, batch):
         batch_flip = dict(batch)
@@ -424,18 +517,35 @@ class SemGazeModule(pl.LightningModule):
     def configure_optimizers(self):
         # Optimizer
         base_lr = float(self.cfg.optimizer.lr)
-        head_lr_mult = float(_cfg_get(self.cfg, "alignment.head_lr_mult", 1.0))
+        reason_head_lr_mult = float(
+            _cfg_get(self.cfg, "alignment_reasoning.head_lr_mult", _cfg_get(self.cfg, "alignment.head_lr_mult", 1.0))
+        )
+        object_head_lr_mult = float(_cfg_get(self.cfg, "alignment_object.head_lr_mult", 1.0))
         trainable_params = [p for p in self.parameters() if p.requires_grad]
         optimizer_params = trainable_params
-        if self.align_enabled and (head_lr_mult != 1.0):
+        param_groups = []
+        grouped_param_ids = set()
+
+        if self.align_enabled and (reason_head_lr_mult != 1.0):
             align_head_param_ids = {id(p) for p in self.model.alignment_head.parameters() if p.requires_grad}
             align_head_params = [p for p in trainable_params if id(p) in align_head_param_ids]
-            base_params = [p for p in trainable_params if id(p) not in align_head_param_ids]
             if len(align_head_params) > 0:
-                optimizer_params = []
-                if len(base_params) > 0:
-                    optimizer_params.append({"params": base_params, "lr": base_lr})
-                optimizer_params.append({"params": align_head_params, "lr": base_lr * head_lr_mult})
+                param_groups.append({"params": align_head_params, "lr": base_lr * reason_head_lr_mult})
+                grouped_param_ids.update(align_head_param_ids)
+
+        if self.object_align_enabled and (object_head_lr_mult != 1.0):
+            object_head_param_ids = {id(p) for p in self.model.object_alignment_head.parameters() if p.requires_grad}
+            object_head_params = [p for p in trainable_params if id(p) in object_head_param_ids]
+            if len(object_head_params) > 0:
+                param_groups.append({"params": object_head_params, "lr": base_lr * object_head_lr_mult})
+                grouped_param_ids.update(object_head_param_ids)
+
+        if len(param_groups) > 0:
+            base_params = [p for p in trainable_params if id(p) not in grouped_param_ids]
+            optimizer_params = []
+            if len(base_params) > 0:
+                optimizer_params.append({"params": base_params, "lr": base_lr})
+            optimizer_params.extend(param_groups)
 
         optimizer = optim.AdamW(
             optimizer_params,
@@ -517,23 +627,92 @@ class SemGazeModule(pl.LightningModule):
         if self.cfg.train.freeze.gaze_decoder:
             self.model.gaze_decoder.apply(self._set_batchnorm_eval)
             self.model.gaze_decoder.apply(self._set_dropout_eval)
+        self._oof_epoch_count = 0
+        self._oof_epoch_total = 0
+        self._oof_epoch_paths = []
+        if self.out_of_frame_log_enabled and self.dataset == "gazehoi":
+            if self.trainer is not None and self.trainer.is_global_zero:
+                os.makedirs(self.out_of_frame_log_dir, exist_ok=True)
             
             
     def training_step(self, batch, batch_idx):
         n = len(batch["image"])
         ni = int(batch["inout"].sum().item())
         inout_mask = batch["inout"] > 0.5
-        reason_valid_mask = batch["reason_valid"] > 0.5
-        align_valid_mask = reason_valid_mask & inout_mask
-        align_path_active = self.align_enabled and ((not self.align_train_only) or self.training)
+        if self.out_of_frame_log_enabled and self.dataset == "gazehoi":
+            out_mask = ~inout_mask
+            out_count = int(out_mask.sum().item())
+            self._oof_epoch_count += out_count
+            self._oof_epoch_total += int(n)
+
+            if out_count > 0 and len(self._oof_epoch_paths) < self.out_of_frame_log_max_paths:
+                batch_paths = batch.get("path", None)
+                if isinstance(batch_paths, (list, tuple)):
+                    out_indices = torch.nonzero(out_mask, as_tuple=False).flatten().tolist()
+                    remaining = self.out_of_frame_log_max_paths - len(self._oof_epoch_paths)
+                    for i in out_indices[:remaining]:
+                        if 0 <= i < len(batch_paths):
+                            self._oof_epoch_paths.append(str(batch_paths[i]))
+                        else:
+                            self._oof_epoch_paths.append("UNKNOWN_PATH")
+        reasoning_valid_mask = (
+            (batch["reasoning_valid"] > 0.5)
+            if "reasoning_valid" in batch
+            else ((batch["reason_valid"] > 0.5) if "reason_valid" in batch else torch.zeros_like(inout_mask, dtype=torch.bool))
+        )
+        object_valid_mask = (
+            (batch["object_valid"] > 0.5)
+            if "object_valid" in batch
+            else torch.zeros_like(inout_mask, dtype=torch.bool)
+        )
+        align_valid_mask = reasoning_valid_mask & inout_mask
+        object_align_valid_mask = object_valid_mask & inout_mask
+        align_path_active = (
+            self.align_enabled
+            and ((not self.align_train_only) or self.training)
+            and (("reasoning_emb" in batch) or ("reason_emb" in batch))
+            and (("reasoning_valid" in batch) or ("reason_valid" in batch))
+        )
+        object_align_path_active = (
+            self.object_align_enabled
+            and ((not self.object_align_train_only) or self.training)
+            and ("object_emb" in batch)
+            and ("object_valid" in batch)
+        )
         
         # Forward pass
-        if align_path_active:
-            gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred, align_feat_pred = self(batch, return_alignment=True)
+        if align_path_active and object_align_path_active:
+            gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred, align_feat_pred, object_align_feat_pred = self(
+                batch,
+                return_alignment=True,
+                return_object_alignment=True,
+            )
             align_feat_pred = align_feat_pred[:, -1, ...]  # select last annotated person token
-        else:
-            gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self(batch, return_alignment=False)
+            object_align_feat_pred = object_align_feat_pred[:, -1, ...]
+        elif align_path_active:
+            gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred, align_feat_pred = self(
+                batch,
+                return_alignment=True,
+                return_object_alignment=False,
+            )
+            align_feat_pred = align_feat_pred[:, -1, ...]  # select last annotated person token
+            object_align_feat_pred = None
+        elif object_align_path_active:
+            gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred, object_align_feat_pred = self(
+                batch,
+                return_alignment=False,
+                return_object_alignment=True,
+            )
             align_feat_pred = None
+            object_align_feat_pred = object_align_feat_pred[:, -1, ...]
+        else:
+            gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self(
+                batch,
+                return_alignment=False,
+                return_object_alignment=False,
+            )
+            align_feat_pred = None
+            object_align_feat_pred = None
         gaze_vec_pred = gaze_vec_pred[:, -1, ...] # (b, n, 64, 64) >> (b, 64, 64) / select last (annotated) person
         gaze_heatmap_pred = gaze_heatmap_pred[:, -1, ...] # (b, n, 64, 64) >> (b, 64, 64)
         gaze_label_emb_pred = gaze_label_emb_pred[:, -1, ...] # (b, n, 512) >> (b, 512)
@@ -552,34 +731,79 @@ class SemGazeModule(pl.LightningModule):
 
         align_loss = torch.tensor(0.0, device=loss.device)
         if align_path_active and align_feat_pred is not None:
+            reasoning_emb_gt = batch["reasoning_emb"] if "reasoning_emb" in batch else batch["reason_emb"]
             align_loss = compute_alignment_loss(
                 emb_pred=align_feat_pred,
-                emb_gt=batch["reason_emb"],
+                emb_gt=reasoning_emb_gt,
                 valid_mask=align_valid_mask,
                 loss_type=self.align_loss_type,
                 logit_scale=self.align_logit_scale,
             )
             loss = loss + self.align_weight * align_loss
 
+        object_align_loss = torch.tensor(0.0, device=loss.device)
+        if object_align_path_active and object_align_feat_pred is not None:
+            object_align_loss = compute_alignment_loss(
+                emb_pred=object_align_feat_pred,
+                emb_gt=batch["object_emb"],
+                valid_mask=object_align_valid_mask,
+                loss_type=self.object_align_loss_type,
+                logit_scale=self.object_align_logit_scale,
+            )
+            loss = loss + self.object_align_weight * object_align_loss
+
         # Logging losses
         self.log("loss/train/heatmap", logs["heatmap_loss"], batch_size=ni, prog_bar=False, on_step=True, on_epoch=True)
         self.log("loss/train/label", logs["label_loss"], batch_size=ni, prog_bar=False, on_step=True, on_epoch=True)
         self.log("loss/train/angular", logs["angular_loss"], batch_size=ni, prog_bar=False, on_step=True, on_epoch=True)
-        self.log("loss/train/align", align_loss.detach(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
-        self.log("loss/train/base", logs["total_loss"], batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("loss/train/align_reasoning", align_loss.detach(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("loss/train/align_object", object_align_loss.detach(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
         self.log("stats/train/inout_ratio", inout_mask.float().mean(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
-        self.log("stats/train/reason_valid_ratio", reason_valid_mask.float().mean(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
-        self.log("stats/train/align_mask_ratio", align_valid_mask.float().mean(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
-        self.log("stats/train/align_mask_count", align_valid_mask.float().sum(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("stats/train/reasoning_valid_ratio", reasoning_valid_mask.float().mean(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("stats/train/object_valid_ratio", object_valid_mask.float().mean(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("stats/train/reasoning_align_mask_ratio", align_valid_mask.float().mean(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("stats/train/reasoning_align_mask_count", align_valid_mask.float().sum(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("stats/train/object_align_mask_ratio", object_align_valid_mask.float().mean(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("stats/train/object_align_mask_count", object_align_valid_mask.float().sum(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
         self.log("loss/train", loss.detach(), batch_size=n, prog_bar=True, on_step=True, on_epoch=True)
 
         return {"loss": loss}
+
+
+    def on_train_epoch_end(self):
+        if not (self.out_of_frame_log_enabled and self.dataset == "gazehoi"):
+            return
+
+        total = int(self._oof_epoch_total)
+        out = int(self._oof_epoch_count)
+        ratio = (float(out) / float(total)) if total > 0 else 0.0
+        self.log("stats/train/out_of_frame_count", float(out), prog_bar=False, on_step=False, on_epoch=True)
+        self.log("stats/train/out_of_frame_ratio", ratio, prog_bar=False, on_step=False, on_epoch=True)
+
+        if self.trainer is None or (not self.trainer.is_global_zero):
+            return
+
+        os.makedirs(self.out_of_frame_log_dir, exist_ok=True)
+        epoch_idx = int(self.current_epoch)
+        log_path = os.path.join(self.out_of_frame_log_dir, f"epoch_{epoch_idx:03d}.log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(f"epoch: {epoch_idx}\n")
+            f.write(f"dataset: {self.dataset}\n")
+            f.write(f"total_train_samples_seen: {total}\n")
+            f.write(f"out_of_frame_count: {out}\n")
+            f.write(f"out_of_frame_ratio: {ratio:.8f}\n")
+            f.write(f"max_paths_per_epoch: {self.out_of_frame_log_max_paths}\n")
+            f.write(f"logged_paths_count: {len(self._oof_epoch_paths)}\n")
+            f.write("paths:\n")
+            for p in self._oof_epoch_paths:
+                f.write(f"{p}\n")
     
     
     def on_after_backward(self):
         # Clipping temperature value
         self.logit_scale.data = torch.clamp(self.logit_scale.data, 0., 4.6052) # 4.6 = log(100)
         self.align_logit_scale.data = torch.clamp(self.align_logit_scale.data, 0., 4.6052)
+        self.object_align_logit_scale.data = torch.clamp(self.object_align_logit_scale.data, 0., 4.6052)
 
         
     def validation_step(self, batch, batch_idx):
@@ -683,6 +907,9 @@ class SemGaze(nn.Module):
         decoder_num_heads: int = 8,
         decoder_label_emb_dim: int = 512,
         alignment_feature_dim: int = 1024,
+        object_alignment_feature_dim: int = 1024,
+        reasoning_alignment_head_type: str = "mlp",
+        object_alignment_head_type: str = "mlp",
     ):
         super().__init__()
         
@@ -696,6 +923,11 @@ class SemGaze(nn.Module):
         )
 
         self.encoder = DINOv3ViTModel.from_pretrained(image_encoder_name)
+        self.image_encoder_dim = int(getattr(self.encoder.config, "hidden_size", token_dim))
+        self.image_to_decoder_proj = nn.Linear(self.image_encoder_dim, token_dim)
+        if self.image_encoder_dim == token_dim:
+            nn.init.eye_(self.image_to_decoder_proj.weight)
+            nn.init.zeros_(self.image_to_decoder_proj.bias)
 
         self.gaze_decoder = GazeDecoder(
             token_dim=token_dim, 
@@ -703,17 +935,41 @@ class SemGaze(nn.Module):
             num_heads=decoder_num_heads,
             label_emb_dim=decoder_label_emb_dim
         )
-        align_hidden_dim = (token_dim + alignment_feature_dim) // 2
-        self.alignment_head = nn.Sequential(
-            nn.LayerNorm(token_dim),
-            nn.Linear(token_dim, align_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(p=0.1),
-            nn.Linear(align_hidden_dim, alignment_feature_dim),
+        self.alignment_head = self._build_alignment_head(
+            token_dim=token_dim,
+            output_dim=alignment_feature_dim,
+            head_type=reasoning_alignment_head_type,
+        )
+        self.object_alignment_head = self._build_alignment_head(
+            token_dim=token_dim,
+            output_dim=object_alignment_feature_dim,
+            head_type=object_alignment_head_type,
         )
 
+    @staticmethod
+    def _build_alignment_head(token_dim: int, output_dim: int, head_type: str) -> nn.Module:
+        head_type = str(head_type).lower()
+        if head_type == "projection":
+            return nn.Linear(token_dim, output_dim)
+        if head_type == "mlp":
+            hidden_dim = (token_dim + output_dim) // 2
+            return nn.Sequential(
+                nn.LayerNorm(token_dim),
+                nn.Linear(token_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(p=0.1),
+                nn.Linear(hidden_dim, output_dim),
+            )
+        raise ValueError(f"Unsupported alignment head_type: {head_type}. Use one of {{'projection', 'mlp'}}.")
 
-    def forward(self, sample, return_alignment: bool = False, align_layer_index: int = 1):
+
+    def forward(
+        self,
+        sample,
+        return_alignment: bool = False,
+        align_layer_index: int = 1,
+        return_object_alignment: bool = False,
+    ):
         # Expected sample = {"image": image, "heads": heads, "head_bboxes": head_bboxes}
         
         # Encode Gaze Tokens ===================================================
@@ -722,6 +978,7 @@ class SemGaze(nn.Module):
         # Encode Image =====================================================
         image_tokens = self.encoder(pixel_values=sample["image"]).last_hidden_state  # (b, t+1, d)
         image_tokens = image_tokens[:, (1 + self.encoder.config.num_register_tokens):, :] # (b, t, d), remove cls token and register tokens
+        image_tokens = self.image_to_decoder_proj(image_tokens)  # (b, t, token_dim)
         b, t, d = image_tokens.shape
         
         s = int(math.sqrt(t)) # This s should now be equal to s_spatial
@@ -729,6 +986,20 @@ class SemGaze(nn.Module):
         image_tokens = image_tokens.permute(0, 2, 1).view(b, d, s, s) # (b, d, t) >> (b, d, s, s)
         
         # Decode Gaze Target =====================================================
+        if return_alignment and return_object_alignment:
+            gaze_heatmap, gaze_label_emb, align_tokens, object_tokens = self.gaze_decoder(
+                image_tokens,
+                gaze_tokens,
+                return_alignment_tokens=True,
+                align_layer_index=align_layer_index,
+                return_object_tokens=True,
+            )
+            align_feat = self.alignment_head(align_tokens)
+            align_feat = F.normalize(align_feat, p=2, dim=-1)
+            object_align_feat = self.object_alignment_head(object_tokens)
+            object_align_feat = F.normalize(object_align_feat, p=2, dim=-1)
+            return gaze_heatmap, gaze_vec, gaze_label_emb, align_feat, object_align_feat
+
         if return_alignment:
             gaze_heatmap, gaze_label_emb, align_tokens = self.gaze_decoder(
                 image_tokens,
@@ -739,6 +1010,17 @@ class SemGaze(nn.Module):
             align_feat = self.alignment_head(align_tokens)
             align_feat = F.normalize(align_feat, p=2, dim=-1)
             return gaze_heatmap, gaze_vec, gaze_label_emb, align_feat
+
+        if return_object_alignment:
+            gaze_heatmap, gaze_label_emb, object_tokens = self.gaze_decoder(
+                image_tokens,
+                gaze_tokens,
+                return_alignment_tokens=False,
+                return_object_tokens=True,
+            )
+            object_align_feat = self.object_alignment_head(object_tokens)
+            object_align_feat = F.normalize(object_align_feat, p=2, dim=-1)
+            return gaze_heatmap, gaze_vec, gaze_label_emb, object_align_feat
 
         gaze_heatmap, gaze_label_emb = self.gaze_decoder(image_tokens, gaze_tokens)  # (b, n, hm_h, hm_w), (b, n, 512)
         return gaze_heatmap, gaze_vec, gaze_label_emb

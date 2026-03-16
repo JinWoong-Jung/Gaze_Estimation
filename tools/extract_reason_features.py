@@ -256,7 +256,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--text_mode",
         type=str,
-        default="object_reasoning",
+        default="object_only",
         choices=["object_reasoning", "object_only", "reasoning_only"],
     )
     parser.add_argument("--batch_size", type=int, default=512)

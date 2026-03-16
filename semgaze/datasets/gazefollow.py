@@ -56,10 +56,13 @@ class GazeFollowDataset(Dataset):
         num_people: int = 1,
         head_thr: float = 0.5,
         return_head_mask: bool = False,
-        reason_feature_root: Union[str, None] = None,
-        reason_feature_preload: bool = False,
-        reason_feature_dim: int = 768,
-        reason_log_limit: int = 20,
+        reasoning_feature_root: Union[str, None] = None,
+        reasoning_feature_preload: bool = False,
+        reasoning_feature_dim: int = 768,
+        object_feature_root: Union[str, None] = None,
+        object_feature_preload: bool = False,
+        object_feature_dim: int = 768,
+        reasoning_log_limit: int = 20,
     ):
         super().__init__()
 
@@ -78,27 +81,49 @@ class GazeFollowDataset(Dataset):
         self.num_people = num_people
         self.head_thr = head_thr
         self.return_head_mask = return_head_mask
-        self.reason_feature_root = reason_feature_root
-        self.reason_feature_preload = reason_feature_preload
-        self.reason_feature_dim = reason_feature_dim
-        self.reason_log_limit = reason_log_limit
-        self.reason_warn_count = 0
+        self.reasoning_feature_root = reasoning_feature_root
+        self.reasoning_feature_preload = reasoning_feature_preload
+        self.reasoning_feature_dim = reasoning_feature_dim
+        self.object_feature_root = object_feature_root
+        self.object_feature_preload = object_feature_preload
+        self.object_feature_dim = object_feature_dim
+        self.reasoning_log_limit = reasoning_log_limit
+        self.reasoning_warn_count = 0
+        self.object_warn_count = 0
         self.label_emb_cache = {}
         self.annotations, self.vocab2id = self.load_annotations()
-        self.reason_feature_h5_path = None
-        self.reason_feature_h5 = None
-        self.reason_feature_index = None
-        if (self.split == "train") and (self.reason_feature_root is not None):
-            self.reason_feature_h5_path = os.path.join(self.reason_feature_root, f"{self.split}.h5")
+        self.reasoning_feature_h5_path = None
+        self.reasoning_feature_h5 = None
+        self.reasoning_feature_index = None
+        if (self.split == "train") and (self.reasoning_feature_root is not None):
+            self.reasoning_feature_h5_path = os.path.join(self.reasoning_feature_root, f"{self.split}.h5")
+        self.object_feature_h5_path = None
+        self.object_feature_h5 = None
+        self.object_feature_index = None
+        if (self.split == "train") and (self.object_feature_root is not None):
+            self.object_feature_h5_path = os.path.join(self.object_feature_root, f"{self.split}.h5")
 
-    def _warn_reason(self, msg: str):
-        if self.reason_warn_count < self.reason_log_limit:
-            print(f"[GazeFollowDataset][reason] {msg}")
-            self.reason_warn_count += 1
-            if self.reason_warn_count == self.reason_log_limit:
-                print("[GazeFollowDataset][reason] warning log limit reached; suppressing further messages.")
+        # Optional eager preload: open h5 + build key->row index once at startup.
+        if self.reasoning_feature_preload and (self.reasoning_feature_h5_path is not None):
+            self.reasoning_feature_index = self._build_reasoning_feature_index()
+        if self.object_feature_preload and (self.object_feature_h5_path is not None):
+            self.object_feature_index = self._build_object_feature_index()
 
-    def _get_reason_feature_key(self, image_path: str, sample_id: Union[int, str]) -> str:
+    def _warn_reasoning(self, msg: str):
+        if self.reasoning_warn_count < self.reasoning_log_limit:
+            print(f"[GazeFollowDataset][reasoning] {msg}")
+            self.reasoning_warn_count += 1
+            if self.reasoning_warn_count == self.reasoning_log_limit:
+                print("[GazeFollowDataset][reasoning] warning log limit reached; suppressing further messages.")
+
+    def _warn_object(self, msg: str):
+        if self.object_warn_count < self.reasoning_log_limit:
+            print(f"[GazeFollowDataset][object] {msg}")
+            self.object_warn_count += 1
+            if self.object_warn_count == self.reasoning_log_limit:
+                print("[GazeFollowDataset][object] warning log limit reached; suppressing further messages.")
+
+    def _get_reasoning_feature_key(self, image_path: str, sample_id: Union[int, str]) -> str:
         rel_dir = os.path.dirname(image_path)  # e.g. train/00000000
         split_prefix = f"{self.split}/"
         if rel_dir.startswith(split_prefix):
@@ -115,30 +140,30 @@ class GazeFollowDataset(Dataset):
             self.label_emb_cache[gaze_label] = label_emb
         return self.label_emb_cache[gaze_label].clone()
 
-    def _ensure_reason_feature_h5(self):
-        if self.reason_feature_h5 is not None:
+    def _ensure_reasoning_feature_h5(self):
+        if self.reasoning_feature_h5 is not None:
             return True
-        if self.reason_feature_h5_path is None:
+        if self.reasoning_feature_h5_path is None:
             return False
-        if not os.path.exists(self.reason_feature_h5_path):
-            self._warn_reason(f"missing h5 feature file: {self.reason_feature_h5_path}")
+        if not os.path.exists(self.reasoning_feature_h5_path):
+            self._warn_reasoning(f"missing h5 feature file: {self.reasoning_feature_h5_path}")
             return False
         try:
-            self.reason_feature_h5 = h5py.File(self.reason_feature_h5_path, "r")
+            self.reasoning_feature_h5 = h5py.File(self.reasoning_feature_h5_path, "r")
             return True
         except Exception as exc:
-            self._warn_reason(f"failed opening h5 feature file: {self.reason_feature_h5_path} ({exc})")
-            self.reason_feature_h5 = None
+            self._warn_reasoning(f"failed opening h5 feature file: {self.reasoning_feature_h5_path} ({exc})")
+            self.reasoning_feature_h5 = None
             return False
 
-    def _build_reason_feature_index(self):
-        if not self._ensure_reason_feature_h5():
+    def _build_reasoning_feature_index(self):
+        if not self._ensure_reasoning_feature_h5():
             return {}
         start_time = time.time()
         index = {}
-        keys_ds = self.reason_feature_h5.get("keys")
+        keys_ds = self.reasoning_feature_h5.get("keys")
         if keys_ds is None:
-            self._warn_reason(f"missing dataset `keys` in h5: {self.reason_feature_h5_path}")
+            self._warn_reasoning(f"missing dataset `keys` in h5: {self.reasoning_feature_h5_path}")
             return index
         for i, key in enumerate(keys_ds):
             if isinstance(key, bytes):
@@ -146,21 +171,21 @@ class GazeFollowDataset(Dataset):
             index[str(key)] = i
         elapsed = time.time() - start_time
         print(
-            f"[GazeFollowDataset][reason] preload index complete: "
+            f"[GazeFollowDataset][reasoning] preload index complete: "
             f"entries={len(index)}, elapsed={elapsed:.1f}s"
         )
         return index
 
-    def _load_reason_feature_from_h5(self, reason_key: str):
-        if not self._ensure_reason_feature_h5():
+    def _load_reasoning_feature_from_h5(self, reasoning_key: str):
+        if not self._ensure_reasoning_feature_h5():
             return None
-        if self.reason_feature_index is None:
-            self.reason_feature_index = self._build_reason_feature_index()
-        emb_ds = self.reason_feature_h5.get("embeddings")
+        if self.reasoning_feature_index is None:
+            self.reasoning_feature_index = self._build_reasoning_feature_index()
+        emb_ds = self.reasoning_feature_h5.get("embeddings")
         if emb_ds is None:
-            self._warn_reason(f"missing dataset `embeddings` in h5: {self.reason_feature_h5_path}")
+            self._warn_reasoning(f"missing dataset `embeddings` in h5: {self.reasoning_feature_h5_path}")
             return None
-        row_idx = self.reason_feature_index.get(reason_key)
+        row_idx = self.reasoning_feature_index.get(reasoning_key)
         if row_idx is None:
             return None
         try:
@@ -168,7 +193,63 @@ class GazeFollowDataset(Dataset):
             emb = F.normalize(emb, p=2, dim=-1)
             return emb
         except Exception as exc:
-            self._warn_reason(f"failed loading h5 feature: key={reason_key} ({exc})")
+            self._warn_reasoning(f"failed loading h5 feature: key={reasoning_key} ({exc})")
+            return None
+
+    def _ensure_object_feature_h5(self):
+        if self.object_feature_h5 is not None:
+            return True
+        if self.object_feature_h5_path is None:
+            return False
+        if not os.path.exists(self.object_feature_h5_path):
+            self._warn_object(f"missing h5 feature file: {self.object_feature_h5_path}")
+            return False
+        try:
+            self.object_feature_h5 = h5py.File(self.object_feature_h5_path, "r")
+            return True
+        except Exception as exc:
+            self._warn_object(f"failed opening h5 feature file: {self.object_feature_h5_path} ({exc})")
+            self.object_feature_h5 = None
+            return False
+
+    def _build_object_feature_index(self):
+        if not self._ensure_object_feature_h5():
+            return {}
+        start_time = time.time()
+        index = {}
+        keys_ds = self.object_feature_h5.get("keys")
+        if keys_ds is None:
+            self._warn_object(f"missing dataset `keys` in h5: {self.object_feature_h5_path}")
+            return index
+        for i, key in enumerate(keys_ds):
+            if isinstance(key, bytes):
+                key = key.decode("utf-8")
+            index[str(key)] = i
+        elapsed = time.time() - start_time
+        print(
+            f"[GazeFollowDataset][object] preload index complete: "
+            f"entries={len(index)}, elapsed={elapsed:.1f}s"
+        )
+        return index
+
+    def _load_object_feature_from_h5(self, object_key: str):
+        if not self._ensure_object_feature_h5():
+            return None
+        if self.object_feature_index is None:
+            self.object_feature_index = self._build_object_feature_index()
+        emb_ds = self.object_feature_h5.get("embeddings")
+        if emb_ds is None:
+            self._warn_object(f"missing dataset `embeddings` in h5: {self.object_feature_h5_path}")
+            return None
+        row_idx = self.object_feature_index.get(object_key)
+        if row_idx is None:
+            return None
+        try:
+            emb = torch.from_numpy(emb_ds[row_idx]).to(torch.float32)
+            emb = F.normalize(emb, p=2, dim=-1)
+            return emb
+        except Exception as exc:
+            self._warn_object(f"failed loading h5 feature: key={object_key} ({exc})")
             return None
 
     def load_annotations(self) -> pd.DataFrame:
@@ -314,16 +395,27 @@ class GazeFollowDataset(Dataset):
         else:
             gaze_label_emb = self._get_label_embedding(gaze_label)
 
-        reason_emb = torch.zeros(self.reason_feature_dim, dtype=torch.float32)
-        reason_valid = torch.tensor(0.0, dtype=torch.float32)
-        if (self.split == "train") and (self.reason_feature_root is not None):
-            reason_key = self._get_reason_feature_key(path, idx)
-            loaded_reason_emb = self._load_reason_feature_from_h5(reason_key)
-            if loaded_reason_emb is not None:
-                reason_emb = loaded_reason_emb
-                reason_valid = torch.tensor(1.0, dtype=torch.float32)
+        reasoning_emb = torch.zeros(self.reasoning_feature_dim, dtype=torch.float32)
+        reasoning_valid = torch.tensor(0.0, dtype=torch.float32)
+        if (self.split == "train") and (self.reasoning_feature_root is not None):
+            reasoning_key = self._get_reasoning_feature_key(path, idx)
+            loaded_reasoning_emb = self._load_reasoning_feature_from_h5(reasoning_key)
+            if loaded_reasoning_emb is not None:
+                reasoning_emb = loaded_reasoning_emb
+                reasoning_valid = torch.tensor(1.0, dtype=torch.float32)
             else:
-                self._warn_reason(f"missing h5 feature key: {reason_key}")
+                self._warn_reasoning(f"missing h5 feature key: {reasoning_key}")
+
+        object_emb = torch.zeros(self.object_feature_dim, dtype=torch.float32)
+        object_valid = torch.tensor(0.0, dtype=torch.float32)
+        if (self.split == "train") and (self.object_feature_root is not None):
+            object_key = self._get_reasoning_feature_key(path, idx)
+            loaded_object_emb = self._load_object_feature_from_h5(object_key)
+            if loaded_object_emb is not None:
+                object_emb = loaded_object_emb
+                object_valid = torch.tensor(1.0, dtype=torch.float32)
+            else:
+                self._warn_object(f"missing h5 feature key: {object_key}")
 
         sample = {
             "image": image,
@@ -336,8 +428,10 @@ class GazeFollowDataset(Dataset):
             "gaze_label_ids": gaze_label_ids,
             "gaze_label_emb": gaze_label_emb,
             "inout": inout,
-            "reason_emb": reason_emb,
-            "reason_valid": reason_valid,
+            "reasoning_emb": reasoning_emb,
+            "reasoning_valid": reasoning_valid,
+            "object_emb": object_emb,
+            "object_valid": object_valid,
             "id": idx,
             "img_size": torch.tensor((img_w, img_h), dtype=torch.long),
             "path": path,
@@ -403,10 +497,13 @@ class GazeFollowDataModule(pl.LightningDataModule):
         heatmap_size: Union[int, tuple[int, int]] = 64,
         num_people: dict = {"train": 1, "val": 1, "test": 1},
         return_head_mask: bool = False,
-        reason_feature_root: Union[str, None] = None,
-        reason_feature_preload: bool = False,
-        reason_feature_dim: int = 768,
-        reason_log_limit: int = 20,
+        reasoning_feature_root: Union[str, None] = None,
+        reasoning_feature_preload: bool = False,
+        reasoning_feature_dim: int = 768,
+        object_feature_root: Union[str, None] = None,
+        object_feature_preload: bool = False,
+        object_feature_dim: int = 768,
+        reasoning_log_limit: int = 20,
     ):
         super().__init__()
         self.root = root
@@ -418,10 +515,13 @@ class GazeFollowDataModule(pl.LightningDataModule):
         self.num_people = {stage: num_people for stage in ["train", "val", "test"]} if isinstance(num_people, int) else num_people
         self.batch_size = {stage: batch_size for stage in ["train", "val", "test"]} if isinstance(batch_size, int) else batch_size
         self.return_head_mask = return_head_mask
-        self.reason_feature_root = reason_feature_root
-        self.reason_feature_preload = reason_feature_preload
-        self.reason_feature_dim = reason_feature_dim
-        self.reason_log_limit = reason_log_limit
+        self.reasoning_feature_root = reasoning_feature_root
+        self.reasoning_feature_preload = reasoning_feature_preload
+        self.reasoning_feature_dim = reasoning_feature_dim
+        self.object_feature_root = object_feature_root
+        self.object_feature_preload = object_feature_preload
+        self.object_feature_dim = object_feature_dim
+        self.reasoning_log_limit = reasoning_log_limit
         
     def setup(self, stage: str):
         if stage == "fit":
@@ -453,10 +553,13 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 heatmap_sigma=self.heatmap_sigma,
                 num_people=self.num_people['train'],
                 return_head_mask=self.return_head_mask,
-                reason_feature_root=self.reason_feature_root,
-                reason_feature_preload=self.reason_feature_preload,
-                reason_feature_dim=self.reason_feature_dim,
-                reason_log_limit=self.reason_log_limit,
+                reasoning_feature_root=self.reasoning_feature_root,
+                reasoning_feature_preload=self.reasoning_feature_preload,
+                reasoning_feature_dim=self.reasoning_feature_dim,
+                object_feature_root=self.object_feature_root,
+                object_feature_preload=self.object_feature_preload,
+                object_feature_dim=self.object_feature_dim,
+                reasoning_log_limit=self.reasoning_log_limit,
             )
 
             val_transform = Compose(
@@ -477,10 +580,13 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 heatmap_sigma=self.heatmap_sigma,
                 num_people=self.num_people['val'],
                 return_head_mask=self.return_head_mask,
-                reason_feature_root=None,
-                reason_feature_preload=False,
-                reason_feature_dim=self.reason_feature_dim,
-                reason_log_limit=self.reason_log_limit,
+                reasoning_feature_root=None,
+                reasoning_feature_preload=False,
+                reasoning_feature_dim=self.reasoning_feature_dim,
+                object_feature_root=None,
+                object_feature_preload=False,
+                object_feature_dim=self.object_feature_dim,
+                reasoning_log_limit=self.reasoning_log_limit,
             )
 
         elif stage == "validate":
@@ -502,10 +608,13 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 heatmap_sigma=self.heatmap_sigma,
                 num_people=self.num_people['val'],
                 return_head_mask=self.return_head_mask,
-                reason_feature_root=None,
-                reason_feature_preload=False,
-                reason_feature_dim=self.reason_feature_dim,
-                reason_log_limit=self.reason_log_limit,
+                reasoning_feature_root=None,
+                reasoning_feature_preload=False,
+                reasoning_feature_dim=self.reasoning_feature_dim,
+                object_feature_root=None,
+                object_feature_preload=False,
+                object_feature_dim=self.object_feature_dim,
+                reasoning_log_limit=self.reasoning_log_limit,
             )
 
         elif stage == "test":
@@ -527,10 +636,13 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 heatmap_sigma=self.heatmap_sigma,
                 num_people=self.num_people['test'],
                 return_head_mask=self.return_head_mask,
-                reason_feature_root=None,
-                reason_feature_preload=False,
-                reason_feature_dim=self.reason_feature_dim,
-                reason_log_limit=self.reason_log_limit,
+                reasoning_feature_root=None,
+                reasoning_feature_preload=False,
+                reasoning_feature_dim=self.reasoning_feature_dim,
+                object_feature_root=None,
+                object_feature_preload=False,
+                object_feature_dim=self.object_feature_dim,
+                reasoning_log_limit=self.reasoning_log_limit,
             )
 
     def train_dataloader(self):

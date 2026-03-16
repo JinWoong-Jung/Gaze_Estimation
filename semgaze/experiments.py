@@ -64,6 +64,60 @@ class Experiment(BaseExperiment):
     def parse_experiment(self, experiment):
         return experiment.split("+")
 
+    def _get_eval_ckpt_path(self):
+        if "train" in self.tasks:
+            return None
+        if "test" in self.tasks:
+            return self.cfg.test.checkpoint
+        if "val" in self.tasks:
+            return self.cfg.val.checkpoint
+        return None
+
+    def _maybe_restore_cfg_from_checkpoint_for_eval(self):
+        ckpt_path = self._get_eval_ckpt_path()
+        if ckpt_path in (None, "", "null"):
+            return
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        hyper_params = ckpt.get("hyper_parameters", {})
+        saved_cfg_dict = hyper_params.get("cfg") if isinstance(hyper_params, dict) else None
+        if not isinstance(saved_cfg_dict, dict):
+            print(
+                colored(
+                    "Checkpoint has no serialized cfg in `hyper_parameters.cfg`; "
+                    "falling back to current runtime cfg.",
+                    TERM_COLOR,
+                )
+            )
+            return
+
+        saved_cfg = omegaconf.OmegaConf.create(saved_cfg_dict)
+        runtime_overrides = omegaconf.OmegaConf.create(
+            {
+                "experiment": {
+                    "task": self.cfg.experiment.task,
+                    "dataset": self.cfg.experiment.dataset,
+                },
+                "project": {
+                    "root": self.cfg.project.root,
+                },
+                "train": {
+                    "device": self.cfg.train.device,
+                    "precision": self.cfg.train.precision,
+                    "matmul_precision": self.cfg.train.matmul_precision,
+                },
+                "val": omegaconf.OmegaConf.to_container(self.cfg.val, resolve=True),
+                "test": omegaconf.OmegaConf.to_container(self.cfg.test, resolve=True),
+                "wandb": {
+                    "log": self.cfg.wandb.log,
+                },
+            }
+        )
+        self.cfg = omegaconf.OmegaConf.merge(saved_cfg, runtime_overrides)
+        print(colored(f"Restored model cfg from checkpoint for eval-only run: {ckpt_path}", TERM_COLOR))
+
     def set_seed(self):
         if self.cfg.train.seed is not None:
             pl.seed_everything(self.cfg.train.seed)
@@ -74,6 +128,24 @@ class Experiment(BaseExperiment):
 
     def init_data(self):
         if self.cfg.experiment.dataset == "gazefollow":
+            reasoning_align_enabled = bool(
+                omegaconf.OmegaConf.select(
+                    self.cfg,
+                    "alignment_reasoning.enabled",
+                    default=omegaconf.OmegaConf.select(self.cfg, "alignment.enabled", default=False),
+                )
+            )
+            object_align_enabled = bool(
+                omegaconf.OmegaConf.select(self.cfg, "alignment_object.enabled", default=False)
+            )
+
+            reasoning_feature_root = omegaconf.OmegaConf.select(
+                self.cfg,
+                "data.gf.reasoning_feature_root",
+                default=omegaconf.OmegaConf.select(self.cfg, "data.gf.reason_feature_root", default=None),
+            )
+            object_feature_root = omegaconf.OmegaConf.select(self.cfg, "data.gf.object_feature_root", default=None)
+
             data = GazeFollowDataModule(
                 root=self.cfg.data.gf.root,
                 root_project=self.cfg.project.root,
@@ -88,10 +160,29 @@ class Experiment(BaseExperiment):
                 heatmap_sigma=self.cfg.data.heatmap_sigma,
                 num_people=self.cfg.data.num_people,
                 return_head_mask=self.cfg.data.return_head_mask,
-                reason_feature_root=omegaconf.OmegaConf.select(self.cfg, "data.gf.reason_feature_root", default=None),
-                reason_feature_preload=omegaconf.OmegaConf.select(self.cfg, "data.gf.reason_feature_preload", default=False),
-                reason_feature_dim=omegaconf.OmegaConf.select(self.cfg, "alignment.feature_dim", default=768),
-                reason_log_limit=omegaconf.OmegaConf.select(self.cfg, "alignment.reason_log_limit", default=20),
+                reasoning_feature_root=reasoning_feature_root if reasoning_align_enabled else None,
+                reasoning_feature_preload=reasoning_align_enabled,
+                reasoning_feature_dim=omegaconf.OmegaConf.select(
+                    self.cfg,
+                    "alignment_reasoning.feature_dim",
+                    default=omegaconf.OmegaConf.select(self.cfg, "alignment.feature_dim", default=768),
+                ),
+                object_feature_root=object_feature_root if object_align_enabled else None,
+                object_feature_preload=object_align_enabled,
+                object_feature_dim=omegaconf.OmegaConf.select(
+                    self.cfg,
+                    "alignment_object.feature_dim",
+                    default=omegaconf.OmegaConf.select(
+                        self.cfg,
+                        "alignment_reasoning.feature_dim",
+                        default=omegaconf.OmegaConf.select(self.cfg, "alignment.feature_dim", default=768),
+                    ),
+                ),
+                reasoning_log_limit=omegaconf.OmegaConf.select(
+                    self.cfg,
+                    "alignment_reasoning.reasoning_log_limit",
+                    default=omegaconf.OmegaConf.select(self.cfg, "alignment.reason_log_limit", default=20),
+                ),
             )
         elif self.cfg.experiment.dataset == "gazehoi":
             data = GazeHOIDataModule(
@@ -194,6 +285,7 @@ class Experiment(BaseExperiment):
 
     def setup(self):
         print(colored("Setting up the experiment ...", TERM_COLOR))
+        self._maybe_restore_cfg_from_checkpoint_for_eval()
         # SET SEED
         self.set_seed()
 

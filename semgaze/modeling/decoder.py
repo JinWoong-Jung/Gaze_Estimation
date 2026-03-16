@@ -74,6 +74,7 @@ class GazeDecoder(nn.Module):
         gaze_tokens: torch.Tensor,
         return_alignment_tokens: bool = False,
         align_layer_index: int = 1,
+        return_object_tokens: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Predict gaze heatmaps and gaze label embeddings given image and gaze tokens.
@@ -129,11 +130,16 @@ class GazeDecoder(nn.Module):
             gaze_heatmap = F.interpolate(gaze_heatmap, size=(64, 64), mode='bilinear', align_corners=False)
 
         # Predict gaze label
-        gaze_label_emb = self.label_mlp(gaze_tokens) # (b*n, 512)
+        gaze_label_emb, label_hidden = self.label_mlp.forward_with_penultimate(gaze_tokens) # (b*n, 512), (b*n, c)
         gaze_label_emb = F.normalize(gaze_label_emb, p=2, dim=1).view(b, pn, -1) # (b, n, 512)
+        object_tokens = label_hidden.view(b, pn, -1) if return_object_tokens else None
 
+        if return_alignment_tokens and return_object_tokens:
+            return gaze_heatmap, gaze_label_emb, align_tokens, object_tokens
         if return_alignment_tokens:
             return gaze_heatmap, gaze_label_emb, align_tokens
+        if return_object_tokens:
+            return gaze_heatmap, gaze_label_emb, object_tokens
         return gaze_heatmap, gaze_label_emb
 
 
@@ -160,6 +166,21 @@ class MLP(nn.Module):
         if self.sigmoid_output:
             x = F.sigmoid(x)
         return x
+
+    def forward_with_penultimate(self, x):
+        penultimate = None
+        for i, layer in enumerate(self.layers):
+            if i < self.num_layers - 1:
+                x = F.relu(layer(x))
+                if i == self.num_layers - 2:
+                    penultimate = x
+            else:
+                x = layer(x)
+        if self.sigmoid_output:
+            x = F.sigmoid(x)
+        if penultimate is None:
+            penultimate = x
+        return x, penultimate
 
 
 class TwoWayTransformer(nn.Module):
