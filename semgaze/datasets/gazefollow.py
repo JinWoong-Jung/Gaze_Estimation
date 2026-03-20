@@ -91,6 +91,10 @@ class GazeFollowDataset(Dataset):
         self.reasoning_warn_count = 0
         self.object_warn_count = 0
         self.label_emb_cache = {}
+        self.test_groups = None
+        self.test_group_keys = []
+        self.image_paths = []
+        self.length = 0
         self.annotations, self.vocab2id = self.load_annotations()
         self.reasoning_feature_h5_path = None
         self.reasoning_feature_h5 = None
@@ -266,9 +270,6 @@ class GazeFollowDataset(Dataset):
             )
             # Add inout col for consistency (ie. missing from test set)
             annotations["inout"] = 1
-            # Each test image is annotated by multiple people (around 10 on avg.)
-            self.image_paths = annotations.path.unique().tolist()
-            self.length = len(self.image_paths)
 
         elif self.split in ("train", "val"):
             columns = ["path", "id", "body_x", "body_y", "body_w", "body_h", "eye_x", "eye_y", "gaze_x", "gaze_y", 
@@ -289,9 +290,15 @@ class GazeFollowDataset(Dataset):
         merge_on = ["path", "id"] if self.split in ["train", "val"] else ["path"]
         annotations = pd.merge(annotations, df_label, how="left", on=merge_on)
         
-        # Each test image is annotated by multiple people (around 10 on avg.)
-        self.image_paths = sorted(annotations.path.unique())
-        self.length = len(self.image_paths) if self.split == "test" else len(annotations)
+        if self.split == "test":
+            # Group test samples by target person identity, not just image path.
+            self.test_groups = annotations.groupby(["path", "eye_x"], sort=False)
+            self.test_group_keys = list(self.test_groups.groups.keys())
+            self.image_paths = sorted(annotations.path.unique())
+            self.length = len(self.test_group_keys)
+        else:
+            self.image_paths = sorted(annotations.path.unique())
+            self.length = len(annotations)
         
         # Load vocab2id
         with open(os.path.join(self.root_project, 'data/gazefollow/vocab2id.json'), 'r') as f:
@@ -321,12 +328,21 @@ class GazeFollowDataset(Dataset):
             gaze_label_ids = torch.tensor([int(gaze_label_id.item())], dtype=torch.long)
             idx = item["id"]
         elif self.split == "test":
-            image_path = self.image_paths[index]
-            p_annotations = self.annotations[self.annotations.path == image_path]
+            group_key = self.test_group_keys[index]
+            p_annotations = self.test_groups.get_group(group_key)
             gaze_pt = torch.from_numpy(p_annotations[["gaze_x", "gaze_y"]].values).float()
-            p = 20 - len(gaze_pt)
-            gaze_pt = F.pad(gaze_pt, (0, 0, 0, p), value=-1.0)
-            idx = p_annotations["id"].values.tolist() + [-1] * p
+            p = max(0, 20 - len(gaze_pt))
+            if p > 0:
+                gaze_pt = F.pad(gaze_pt, (0, 0, 0, p), value=-1.0)
+            elif gaze_pt.size(0) > 20:
+                gaze_pt = gaze_pt[:20]
+
+            idx = p_annotations["id"].values.tolist()
+            if p > 0:
+                idx = idx + [-1] * p
+            elif len(idx) > 20:
+                idx = idx[:20]
+
             item = p_annotations.iloc[0]
             gaze_label = item.gaze_gt_label
             gaze_labels = item.gaze_gt_labels
@@ -342,7 +358,10 @@ class GazeFollowDataset(Dataset):
                     gaze_label_ids_list = parsed_ids
             gaze_label_ids = torch.tensor(gaze_label_ids_list, dtype=torch.long)
             l = 5 - len(gaze_label_ids)
-            gaze_label_ids = F.pad(gaze_label_ids, (0, l), value=-1)
+            if l > 0:
+                gaze_label_ids = F.pad(gaze_label_ids, (0, l), value=-1)
+            elif l < 0:
+                gaze_label_ids = gaze_label_ids[:5]
 
         inout = torch.tensor(item["inout"], dtype=torch.float)
         path = item["path"]
@@ -442,6 +461,7 @@ class GazeFollowDataset(Dataset):
 
         num_heads_current = len(sample["heads"])
         num_target_people = self.num_people if self.num_people != -1 else num_heads_current
+        target_head_idx = num_heads_current - 1
         
         num_missing_heads = num_target_people - num_heads_current
 
@@ -453,8 +473,13 @@ class GazeFollowDataset(Dataset):
             blank_head_tensors = torch.zeros((num_missing_heads, *single_head_shape), dtype=sample["heads"].dtype, device=sample["heads"].device)
             sample["heads"] = torch.cat([sample["heads"], blank_head_tensors], dim=0)
         elif num_missing_heads < 0:
-            sample["heads"] = sample["heads"][:num_target_people]
-            sample["head_bboxes"] = sample["head_bboxes"][:num_target_people]
+            num_context_keep = max(0, num_target_people - 1)
+            sample["heads"] = torch.cat([sample["heads"][:num_context_keep], sample["heads"][-1:]], dim=0)
+            sample["head_bboxes"] = torch.cat([sample["head_bboxes"][:num_context_keep], sample["head_bboxes"][-1:]], dim=0)
+            target_head_idx = num_target_people - 1
+
+        target_head_idx = min(target_head_idx, len(sample["heads"]) - 1)
+        sample["target_head_idx"] = torch.tensor(target_head_idx, dtype=torch.long)
 
         sample["head_centers"] = torch.hstack(
             [
@@ -469,7 +494,7 @@ class GazeFollowDataset(Dataset):
             sample["gaze_heatmap"] = torch.zeros((self.heatmap_size, self.heatmap_size), dtype=torch.float)
 
         new_img_w, new_img_h = get_img_size(sample["image"])
-        gaze_vec = sample["gaze_pt"] - sample["head_centers"][-1]
+        gaze_vec = sample["gaze_pt"] - sample["head_centers"][target_head_idx]
         gaze_vec = gaze_vec * torch.tensor([new_img_w, new_img_h])
         sample["gaze_vec"] = F.normalize(gaze_vec, p=2, dim=-1)
 

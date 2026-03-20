@@ -108,6 +108,11 @@ class SemGazeModule(pl.LightningModule):
         )
         self.test_tta_enabled = bool(_cfg_get(cfg, "test.tta.enabled", False))
         self.test_tta_hflip = bool(_cfg_get(cfg, "test.tta.hflip", True))
+        self.test_l2_eval_mode = str(_cfg_get(cfg, "test.l2_eval_mode", "argmax")).lower()
+        if self.test_l2_eval_mode not in ("argmax", "dark"):
+            raise ValueError(
+                f"Expected `test.l2_eval_mode` to be one of ['argmax', 'dark'], got {self.test_l2_eval_mode}."
+            )
 
         self.model = SemGaze(
             image_size=cfg.model.semgaze.image_size,
@@ -115,6 +120,13 @@ class SemGazeModule(pl.LightningModule):
             token_dim=cfg.model.semgaze.token_dim, 
             gaze_vec_dim=cfg.model.semgaze.gaze_vec_dim, 
             image_encoder_name=self.image_encoder_name,
+            use_image_to_decoder_proj=bool(
+                _cfg_get(
+                    cfg,
+                    "model.semgaze.image_to_decoder_proj.enabled",
+                    _cfg_get(cfg, "model.semgaze.use_image_to_decoder_proj", True),
+                )
+            ),
             decoder_depth=cfg.model.semgaze.decoder_depth, 
             decoder_num_heads=cfg.model.semgaze.decoder_num_heads, 
             decoder_label_emb_dim=512,
@@ -223,6 +235,11 @@ class SemGazeModule(pl.LightningModule):
             )
         ).lower()
         self.object_align_weight = float(_cfg_get(cfg, "loss.weight_align_object", 0.0))
+        self.heatmap_loss_fn = str(_cfg_get(cfg, "loss.heatmap_loss_fn", "mse")).lower()
+        if self.heatmap_loss_fn not in {"mse", "bce"}:
+            raise ValueError(
+                f"Expected `loss.heatmap_loss_fn` to be one of ['mse', 'bce'], got {self.heatmap_loss_fn}."
+            )
         self.label_objective = str(_cfg_get(cfg, "loss.label_objective", "legacy_infonce")).lower()
         self.label_margin_type = str(_cfg_get(cfg, "loss.label_margin_type", "none")).lower()
         self.label_margin = float(_cfg_get(cfg, "loss.label_margin", 0.0))
@@ -480,7 +497,12 @@ class SemGazeModule(pl.LightningModule):
         angular_loss = torch.tensor(0.0, device=device)
 
         if torch.sum(inout_gt) > 0:  # to avoid case where all samples of the batch are outside (i.e. division by 0)
-            heatmap_loss = compute_heatmap_loss(gaze_heatmap_pred, gaze_heatmap_gt, inout_gt)
+            heatmap_loss = compute_heatmap_loss(
+                gaze_heatmap_pred,
+                gaze_heatmap_gt,
+                inout_gt,
+                loss_fn=self.heatmap_loss_fn,
+            )
             if self.label_objective in {"legacy_infonce", "batch_local_infonce"}:
                 label_loss = compute_info_nce_loss_batch_local(
                     gaze_label_emb_pred, gaze_label_emb_gt, inout_gt, self.logit_scale
@@ -634,6 +656,25 @@ class SemGazeModule(pl.LightningModule):
             if self.trainer is not None and self.trainer.is_global_zero:
                 os.makedirs(self.out_of_frame_log_dir, exist_ok=True)
             
+    def _select_target_person_token(self, token_tensor: torch.Tensor, batch: Dict) -> torch.Tensor:
+        if token_tensor.ndim < 2:
+            return token_tensor
+
+        target_head_idx = batch.get("target_head_idx", None)
+        if target_head_idx is None:
+            return token_tensor[:, -1, ...]
+
+        if not torch.is_tensor(target_head_idx):
+            target_head_idx = torch.tensor(target_head_idx, device=token_tensor.device)
+        target_head_idx = target_head_idx.to(device=token_tensor.device, dtype=torch.long).view(-1)
+        if target_head_idx.numel() != token_tensor.size(0):
+            return token_tensor[:, -1, ...]
+
+        target_head_idx = target_head_idx.clamp(min=0, max=token_tensor.size(1) - 1)
+        gather_shape = [token_tensor.size(0), 1] + [1] * (token_tensor.ndim - 2)
+        gather_index = target_head_idx.view(*gather_shape).expand(-1, 1, *token_tensor.shape[2:])
+        return token_tensor.gather(1, gather_index).squeeze(1)
+            
             
     def training_step(self, batch, batch_idx):
         n = len(batch["image"])
@@ -687,15 +728,15 @@ class SemGazeModule(pl.LightningModule):
                 return_alignment=True,
                 return_object_alignment=True,
             )
-            align_feat_pred = align_feat_pred[:, -1, ...]  # select last annotated person token
-            object_align_feat_pred = object_align_feat_pred[:, -1, ...]
+            align_feat_pred = self._select_target_person_token(align_feat_pred, batch)
+            object_align_feat_pred = self._select_target_person_token(object_align_feat_pred, batch)
         elif align_path_active:
             gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred, align_feat_pred = self(
                 batch,
                 return_alignment=True,
                 return_object_alignment=False,
             )
-            align_feat_pred = align_feat_pred[:, -1, ...]  # select last annotated person token
+            align_feat_pred = self._select_target_person_token(align_feat_pred, batch)
             object_align_feat_pred = None
         elif object_align_path_active:
             gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred, object_align_feat_pred = self(
@@ -704,7 +745,7 @@ class SemGazeModule(pl.LightningModule):
                 return_object_alignment=True,
             )
             align_feat_pred = None
-            object_align_feat_pred = object_align_feat_pred[:, -1, ...]
+            object_align_feat_pred = self._select_target_person_token(object_align_feat_pred, batch)
         else:
             gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self(
                 batch,
@@ -713,9 +754,9 @@ class SemGazeModule(pl.LightningModule):
             )
             align_feat_pred = None
             object_align_feat_pred = None
-        gaze_vec_pred = gaze_vec_pred[:, -1, ...] # (b, n, 64, 64) >> (b, 64, 64) / select last (annotated) person
-        gaze_heatmap_pred = gaze_heatmap_pred[:, -1, ...] # (b, n, 64, 64) >> (b, 64, 64)
-        gaze_label_emb_pred = gaze_label_emb_pred[:, -1, ...] # (b, n, 512) >> (b, 512)
+        gaze_vec_pred = self._select_target_person_token(gaze_vec_pred, batch)
+        gaze_heatmap_pred = self._select_target_person_token(gaze_heatmap_pred, batch)
+        gaze_label_emb_pred = self._select_target_person_token(gaze_label_emb_pred, batch)
                                 
         # Compute loss
         loss, logs = self.compute_loss(
@@ -812,10 +853,10 @@ class SemGazeModule(pl.LightningModule):
         
         # Forward pass
         gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self(batch, return_alignment=False)
-        gaze_vec_pred = gaze_vec_pred[:, -1, ...] # (b, n, 64, 64) >> (b, 64, 64) / select last (annotated) person
-        gaze_heatmap_pred = gaze_heatmap_pred[:, -1, ...]  # (b, 1, 64, 64) >> (b, 64, 64)
+        gaze_vec_pred = self._select_target_person_token(gaze_vec_pred, batch)
+        gaze_heatmap_pred = self._select_target_person_token(gaze_heatmap_pred, batch)
         gaze_pt_pred = spatial_argmax2d(gaze_heatmap_pred, normalize=True)  # (b, 2)
-        gaze_label_emb_pred = gaze_label_emb_pred[:, -1, ...] # (b, n, 512) >> (b, 512)
+        gaze_label_emb_pred = self._select_target_person_token(gaze_label_emb_pred, batch)
         
         # Compute loss
         loss, logs = self.compute_loss(
@@ -854,18 +895,23 @@ class SemGazeModule(pl.LightningModule):
         n = len(batch["image"])
         ni = int(batch["inout"].sum().item())
 
-        device = batch["gaze_pt"].device
-        vocab_size = self.vocab_emb.size(0)
-                
         # Forward pass
-        gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self._forward_test(batch)
-        gaze_heatmap_pred = gaze_heatmap_pred[:, -1, ...]  # (b, 1, 64, 64) >> (b, 64, 64) / select last person
-        gaze_pt_pred = dark_coordinate_decoding(gaze_heatmap_pred, kernel_size=self.cfg.data.heatmap_sigma * 3, normalize=True)       
-        gaze_label_emb_pred = gaze_label_emb_pred[:, -1, ...] # (b, n, 512) >> (b, 512)
+        gaze_heatmap_pred, _, gaze_label_emb_pred = self._forward_test(batch)
+        gaze_heatmap_pred = self._select_target_person_token(gaze_heatmap_pred, batch)
+        gaze_label_emb_pred = self._select_target_person_token(gaze_label_emb_pred, batch)
         gaze_label_logit_pred = gaze_label_emb_pred @ self.vocab_emb.T * self.logit_scale.exp() # (b, vocab_size)
             
         # Logging dataset-specific metrics
         if self.dataset == "gazefollow":
+            if self.test_l2_eval_mode == "dark":
+                gaze_pt_pred = dark_coordinate_decoding(
+                    gaze_heatmap_pred,
+                    kernel_size=self.cfg.data.heatmap_sigma * 3,
+                    normalize=True,
+                )
+            else:
+                gaze_pt_pred = spatial_argmax2d(gaze_heatmap_pred, normalize=True)
+
             test_dist_to_avg, test_avg_dist, test_min_dist = self.metrics["test_dist"](gaze_pt_pred, batch["gaze_pt"])
             self.metrics["test_auc"].update(gaze_heatmap_pred, batch["gaze_pt"], batch["img_size"])
             self.metrics["test_multi_acc@1"].update(gaze_label_logit_pred, batch["gaze_label_ids"])
@@ -877,6 +923,11 @@ class SemGazeModule(pl.LightningModule):
             self.log("metric/test/multi_acc@1", self.metrics["test_multi_acc@1"], batch_size=n, prog_bar=False, on_step=False, on_epoch=True)
         
         elif self.dataset == "gazehoi":
+            gaze_pt_pred = dark_coordinate_decoding(
+                gaze_heatmap_pred,
+                kernel_size=self.cfg.data.heatmap_sigma * 3,
+                normalize=True,
+            )
             self.metrics["test_dist"].update(gaze_pt_pred, batch["gaze_pt"], batch["inout"])
             self.metrics["test_gaze_acc"].update(gaze_pt_pred, batch["obj_bbox"])
             
@@ -903,6 +954,7 @@ class SemGaze(nn.Module):
         token_dim: int = 768,
         gaze_vec_dim: int = 2,
         image_encoder_name: str = "facebook/dinov3-base",
+        use_image_to_decoder_proj: bool = True,
         decoder_depth: int = 2,
         decoder_num_heads: int = 8,
         decoder_label_emb_dim: int = 512,
@@ -924,10 +976,18 @@ class SemGaze(nn.Module):
 
         self.encoder = DINOv3ViTModel.from_pretrained(image_encoder_name)
         self.image_encoder_dim = int(getattr(self.encoder.config, "hidden_size", token_dim))
+        self.use_image_to_decoder_proj = bool(use_image_to_decoder_proj)
         self.image_to_decoder_proj = nn.Linear(self.image_encoder_dim, token_dim)
         if self.image_encoder_dim == token_dim:
             nn.init.eye_(self.image_to_decoder_proj.weight)
             nn.init.zeros_(self.image_to_decoder_proj.bias)
+        if (not self.use_image_to_decoder_proj) and (self.image_encoder_dim != token_dim):
+            raise ValueError(
+                "image_to_decoder_proj is disabled, but image encoder dim "
+                f"({self.image_encoder_dim}) != token_dim ({token_dim}). "
+                "Set model.semgaze.image_to_decoder_proj.enabled=True, "
+                "or make token_dim match the image encoder hidden size."
+            )
 
         self.gaze_decoder = GazeDecoder(
             token_dim=token_dim, 
@@ -978,7 +1038,8 @@ class SemGaze(nn.Module):
         # Encode Image =====================================================
         image_tokens = self.encoder(pixel_values=sample["image"]).last_hidden_state  # (b, t+1, d)
         image_tokens = image_tokens[:, (1 + self.encoder.config.num_register_tokens):, :] # (b, t, d), remove cls token and register tokens
-        image_tokens = self.image_to_decoder_proj(image_tokens)  # (b, t, token_dim)
+        if self.use_image_to_decoder_proj:
+            image_tokens = self.image_to_decoder_proj(image_tokens)  # (b, t, token_dim)
         b, t, d = image_tokens.shape
         
         s = int(math.sqrt(t)) # This s should now be equal to s_spatial

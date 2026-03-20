@@ -1,0 +1,160 @@
+SemGaze Pipeline Equations (single-person notation)
+===================================================
+
+아래 수식은 사용자가 제시한 기호 표기 스타일을 따르며,
+현재 구현(semgaze/conf/config_gf.yaml, image_size=512, patch_size=16, heatmap_loss_fn=bce)에 맞춘다.
+
+------------------------------------------------------------
+## 1) Image Encoder + Projection
+------------------------------------------------------------
+
+Image Encoder \phi : pre-trained DINOv3-ViT-L/16 (frozen)
+
+Projection Layer \text{Proj}_V
+
+Image : I \in \mathbb R^{3 \times H \times W}
+
+- X = \phi(I) \in \mathbb R^{(1 + R + T) \times D_V}                                  (1)
+- X^{proj} = \text{Proj}_V(X[(1+R):]) \in \mathbb R^{T \times d}                       (2)
+- X^{img} = \text{reshape}(X^{proj}) \in \mathbb R^{d \times S \times S}               (3)
+
+H = W = 512,\; P = 16,\; T = \frac{H}{P}\frac{W}{P} = 1024,\; S = \sqrt{T} = 32
+
+
+------------------------------------------------------------
+## 2) Gaze Encoder
+------------------------------------------------------------
+
+Head crop & bbox : h \in \mathbb R^{3 \times H_h \times W_h},\; b \in \mathbb R^4
+
+ResNet18 backbone f
+
+- e = f(h)                                                                              (4)
+- X^{gaze} = \text{MLP}_g(e) + W_b b \in \mathbb R^{d}                                  (5)
+- v = \text{normalize}(\text{MLP}_v(e)) \in \mathbb R^{2}                                (6)
+
+
+------------------------------------------------------------
+## 3) Token Interaction (Two-way Transformer)
+------------------------------------------------------------
+
+Not-a-person token : q_{na} \in \mathbb R^d
+
+- Q = \text{concat}(X^{gaze}, q_{na}) \in \mathbb R^{2 \times d}                         (7)
+- K = \text{flatten}(X^{img}) \in \mathbb R^{T \times d}                                 (8)
+- (Q', K') = \text{TwoWayTransformer}(Q, K)                                              (9)
+- X'^{img} = \text{reshape}(K') \in \mathbb R^{d \times S \times S}                     (10)
+
+여기서 최종 사람 토큰은 single-person 가정이므로
+- X^{gaze*} = Q'_{1} \in \mathbb R^d                                                     (11)
+
+
+------------------------------------------------------------
+## 4) Heatmap / Label Branch
+------------------------------------------------------------
+
+Upscaler 결과:
+- U = \text{Upscale}(X'^{img}) \in \mathbb R^{d' \times H_u \times W_u},\quad d' = d/8   (12)
+
+Heatmap embedding:
+- e^{hm} = \text{MLP}_{hm}(X^{gaze*}) \in \mathbb R^{d'}                                  (13)
+
+Heatmap logits:
+- \hat{H}^{raw} = e^{hm} \cdot \text{flatten}(U) \in \mathbb R^{H_u \times W_u}          (14)
+- \hat{H} = \text{resize}(\hat{H}^{raw}, 64, 64) \in \mathbb R^{64 \times 64}            (15)
+
+Label embedding:
+- \hat{z} = \text{normalize}(\text{MLP}_{label}(X^{gaze*})) \in \mathbb R^{d_{lbl}}      (16)
+
+Gaze vector:
+- \hat{v} = v \in \mathbb R^2                                                             (17)
+
+
+------------------------------------------------------------
+## 5) Heatmap Loss (BCE-with-logits, in/out masking)
+------------------------------------------------------------
+
+Ground-truth heatmap H \in \mathbb R^{64 \times 64}
+in/out label m \in \{0,1\}
+
+Per-sample heatmap loss:
+
+\ell_{hm}
+=
+\frac{1}{64 \cdot 64}
+\sum_{u=1}^{64}\sum_{v=1}^{64}
+\text{BCEWithLogits}(\hat{H}_{uv}, H_{uv})                                                (18)
+
+Mini-batch masked average:
+
+\mathcal L_{hm}
+=
+\frac{\sum_{b=1}^{B} m_b \ell_{hm}^{(b)}}{\sum_{b=1}^{B} m_b}                             (19)
+
+
+------------------------------------------------------------
+## 6) Other Losses
+------------------------------------------------------------
+
+Angular loss:
+
+\ell_{ang}
+=
+\frac{1 - \langle \hat{v}, v^{gt} \rangle}{2}                                              (20)
+
+\mathcal L_{ang}
+=
+\frac{\sum_{b=1}^{B} m_b \ell_{ang}^{(b)}}{\sum_{b=1}^{B} m_b}                             (21)
+
+Label loss (global vocab CE):
+
+\mathcal L_{lbl}
+=
+\text{CE}\!\left(
+\text{normalize}(\hat{z})\,
+\text{normalize}(E_{vocab})^\top \exp(s),
+y
+\right)                                                                                     (22)
+
+
+------------------------------------------------------------
+## 7) Total Objective
+------------------------------------------------------------
+
+Base loss:
+
+\mathcal L_{base}
+=
+\lambda_{hm}\mathcal L_{hm}
+\;+\;
+\lambda_{ang}\mathcal L_{ang}
+\;+\;
+\lambda_{lbl}\mathcal L_{lbl}                                                               (23)
+
+Current config:
+- \lambda_{hm}=100,\; \lambda_{ang}=3,\; \lambda_{lbl}=1
+
+Optional alignment losses (when enabled):
+- \mathcal L_{reason}, \mathcal L_{obj}
+
+Final:
+
+\mathcal L_{total}
+=
+\mathcal L_{base}
+\;+\;
+\lambda_{reason}\mathcal L_{reason}
+\;+\;
+\lambda_{obj}\mathcal L_{obj}                                                               (24)
+
+Current config:
+- \lambda_{reason}=0.5,\; \lambda_{obj}=0.5
+
+
+------------------------------------------------------------
+## 8) Implementation Note
+------------------------------------------------------------
+
+If \sum_b m_b = 0 (all out-of-frame in a batch),
+the base branch losses are bypassed as implemented in compute_loss().
+

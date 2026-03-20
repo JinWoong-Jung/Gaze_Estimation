@@ -20,7 +20,7 @@ project:
 # ------------------------------------------------------------------------------------------------------------------- #
 
 experiment:
-    name: align = {reasoning, object}, ViT-L, no LoRA, image_size=224 # name of the wandb job
+    name: SOTA(448->512), BCE # name of the wandb job
     group: null # name of the wandb group
     task: train+test # combination of {train, val, test} separated by '+' sign
     dataset: gazefollow # gazefollow, gazehoi
@@ -29,7 +29,7 @@ experiment:
 
 data:
     num_people: 1 # int or -1 to include all people
-    image_size: 256 # 256
+    image_size: 512
     heatmap_size: 64 # 64
     heatmap_sigma: 3
     return_head_mask: False
@@ -64,6 +64,8 @@ model:
                 alpha: 16
                 dropout: 0.05
                 target_modules: [auto] # auto or explicit names
+        image_to_decoder_proj:
+            enabled: True # set False to bypass projection (requires image encoder hidden size == token_dim)
         decoder_depth: 2
         decoder_num_heads: 8
         temp_init_value: 0.07
@@ -74,7 +76,8 @@ model:
 # ------------------------------------------------------------------------------------------------------------------- #
 
 loss:
-    weight_heatmap: 1000
+    weight_heatmap: 100
+    heatmap_loss_fn: bce # mse | bce
     weight_angular: 3 # 3
     weight_label: 1 # 1
     label_objective: global_vocab_ce # legacy_infonce | global_vocab_ce
@@ -154,8 +157,9 @@ val:
 
 test:
     checkpoint: null
-    batch_size: 64
+    batch_size: 128
     device: ${train.device}
+    l2_eval_mode: argmax # argmax (official-style), dark (optional)
     tta:
         enabled: False
         hflip: True

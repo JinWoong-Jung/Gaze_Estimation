@@ -68,7 +68,7 @@ def dark_coordinate_decoding(heatmaps, kernel_size = 3, normalize = False):
                 dark_coords[i] -= offset.flatten()
                 
     if normalize:
-        dark_coords = dark_coords / torch.tensor([hm_h, hm_w], device=device)
+        dark_coords = dark_coords / torch.tensor([hm_w, hm_h], device=device, dtype=dark_coords.dtype)
 
     if ndim == 2:
         dark_coords = dark_coords[0]
@@ -366,7 +366,9 @@ def spatial_argmax2d(heatmap, normalize=True):
         points = points[:, 1:].flip(1)  # (idx, y, x) -> (x, y)
 
         if normalize:
-            points = (points + 1) / torch.tensor(heatmap.size()[1:]).to(heatmap.device)
+            hm_h, hm_w = heatmap.shape[1:]
+            points = points.to(torch.float32)
+            points = points / torch.tensor([hm_w, hm_h], device=heatmap.device, dtype=torch.float32)
 
         if ndim == 2:
             points = points[0]

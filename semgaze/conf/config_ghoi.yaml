@@ -20,7 +20,7 @@ project:
 # ------------------------------------------------------------------------------------------------------------------- #
 
 experiment:
-    name: finetuning on gazehoi # name of the wandb job
+    name: GazeHOI - SOTA(448->512), BCE # name of the wandb job
     group: null # name of the wandb group
     task: train+test # combination of {train, val, test} separated by '+' sign
     dataset: gazehoi # gazefollow, gazehoi
@@ -30,7 +30,7 @@ experiment:
 
 data:
     num_people: 1 # int or -1 to include all people
-    image_size: 448
+    image_size: 512
     heatmap_size: 64
     heatmap_sigma: 3
     return_head_mask: False
@@ -50,7 +50,7 @@ data:
 model:
     semgaze:
         patch_size: 16
-        token_dim: 768 # Decoder token dim (image encoder output is projected to this dim)
+        token_dim: 768
         image_size: ${data.image_size}
         gaze_vec_dim: 2
         image_encoder:
@@ -63,6 +63,8 @@ model:
                 alpha: 16
                 dropout: 0.05
                 target_modules: [auto] # auto or explicit names
+        image_to_decoder_proj:
+            enabled: True # set False to bypass projection (requires image encoder hidden size == token_dim)
         decoder_depth: 2
         decoder_num_heads: 8
         temp_init_value: 0.07
@@ -73,9 +75,10 @@ model:
 # ------------------------------------------------------------------------------------------------------------------- #
 
 loss:
-    weight_heatmap: 1000
-    weight_angular: 3
-    weight_label: 1
+    weight_heatmap: 100
+    heatmap_loss_fn: bce # mse | bce
+    weight_angular: 3 # 3
+    weight_label: 1 # 1
     label_objective: global_vocab_ce # legacy_infonce | global_vocab_ce
     label_margin_type: none # none, cosface, arcface
     label_margin: 0.0
@@ -130,7 +133,7 @@ train:
     resume: False
     resume_from: null
     checkpointing:
-        monitor: "metric/val/gaze_acc" # "metric/val/dist" (default), "loss/val", etc.
+        monitor: "metric/val/gaze_acc" # "metric/val/gaze_acc" (default), "loss/val", etc.
         mode: "max" # "min" (default), "max"
     freeze:
         gaze_encoder: False
