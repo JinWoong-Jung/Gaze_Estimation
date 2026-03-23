@@ -23,7 +23,7 @@ experiment:
     name: semgaze_dinov3 # name of the wandb job
     group: null # name of the wandb group
     task: train+test # combination of {train, val, test} separated by '+' sign
-    dataset: gazefollow # gazefollow, gazehoi
+    dataset: gazefollow # gazefollow, gazehoi, vat
     path: ${hydra:runtime.cwd} # to retrieve logs and checkpoints
 
 # ------------------------------------------------------------------------------------------------------------------- #
@@ -49,6 +49,10 @@ data:
         root: /home/elicer/semgaze/data/gazehoi # FILL ME
         num_train_samples: 47044
         vocab_size: 463
+    vat:
+        root: /home/elicer/semgaze/data/vat
+        num_train_samples: 132563
+        vocab_size: 1
 
 
 # ------------------------------------------------------------------------------------------------------------------- #
@@ -63,12 +67,6 @@ model:
         decoder_depth: 2
         decoder_num_heads: 8
         temp_init_value: 0.07
-        image_encoder_lora:
-            enabled: False
-            r: 8
-            alpha: 16
-            dropout: 0.05
-            target_modules: [auto] # auto or explicit names
     pretraining:
         gaze_backbone: /home/elicer/semgaze/weights/gaze360_resnet18.pt # FILL ME
     weights: null # /!\ null (default), or path to a checkpoint (overrides pretraining weights)
@@ -79,7 +77,7 @@ loss:
     weight_heatmap: 1000
     weight_angular: 3
     weight_label: 1
-    label_objective: legacy_infonce # legacy_infonce | global_vocab_ce
+    label_objective: infonce # infonce | global_vocab_ce
     label_margin_type: none # none, cosface, arcface
     label_margin: 0.0
     label_easy_margin: False

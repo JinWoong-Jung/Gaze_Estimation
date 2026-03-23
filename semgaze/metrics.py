@@ -132,6 +132,77 @@ class GFTestAUC(tm.Metric):
         return auc
 
 
+class VATAUC(tm.Metric):
+    higher_is_better: bool = True
+    full_state_update: bool = False
+
+    def __init__(self, resolution: int = 64, sigma: int = 3):
+        """
+        Computes AUC for VAT-style single gaze point supervision.
+        AUC is computed only for in-frame samples (inout==1).
+        Mirrors Gazelle VAT protocol:
+        evaluate directly on 64x64 heatmap space with a tolerance region
+        around the single ground-truth gaze point.
+        """
+        super().__init__()
+        self.resolution = int(resolution)
+        self.sigma = int(sigma)
+        self.add_state("sum_auc", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("num_obs", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(
+        self,
+        gaze_heatmap_pred: torch.Tensor,
+        gaze_pt: torch.Tensor,
+        img_size: torch.Tensor,
+        inout: torch.Tensor,
+    ):
+        # img_size is unused on purpose: VAT AUC is computed in fixed heatmap space.
+        del img_size
+
+        res = self.resolution
+        sigma = self.sigma
+        three_sigma = 3 * sigma
+
+        for hm_pred, gp_gt, io in zip(gaze_heatmap_pred, gaze_pt, inout):
+            if float(io.item()) < 0.5:
+                continue
+
+            if hm_pred.shape[-2:] != (res, res):
+                hm_pred = F.interpolate(
+                    hm_pred.unsqueeze(0).unsqueeze(0),
+                    size=(res, res),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0).squeeze(0)
+
+            # Gazelle VAT uses a rectangular tolerance region around GT point.
+            target_map = torch.zeros((res, res), device=hm_pred.device, dtype=torch.int)
+            gx = float(gp_gt[0].item()) * res
+            gy = float(gp_gt[1].item()) * res
+            ul_x = max(0, int(gx - three_sigma))
+            ul_y = max(0, int(gy - three_sigma))
+            br_x = min(int(gx + three_sigma + 1), res - 1)
+            br_y = min(int(gy + three_sigma + 1), res - 1)
+            if (br_x > ul_x) and (br_y > ul_y):
+                target_map[ul_y:br_y, ul_x:br_x] = 1
+            try:
+                auc = roc_auc_score(
+                    target_map.detach().cpu().flatten().numpy(),
+                    hm_pred.detach().cpu().flatten().numpy(),
+                )
+            except ValueError:
+                continue
+
+            self.sum_auc += torch.tensor(float(auc), device=self.device)
+            self.num_obs += 1
+
+    def compute(self):
+        if self.num_obs == 0:
+            return torch.tensor(0.0, device=self.device)
+        return self.sum_auc / self.num_obs
+
+
 class GazeAccuracy(tm.Metric):
     higher_is_better = True
     full_state_update: bool = False

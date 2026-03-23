@@ -14,11 +14,10 @@ import math
 import json
 from termcolor import colored
 from collections import OrderedDict
-from typing import Dict, List, Optional, Tuple, Type, Union
+from typing import Dict, Type
 import omegaconf
 
 import wandb
-import pandas as pd
 
 import torch
 import torch.nn as nn
@@ -36,7 +35,7 @@ except Exception:
 import torchmetrics as tm
 import pytorch_lightning as pl
 
-from semgaze.modeling.encoder import GazeEncoder, SpatialInputTokenizer, ViTEncoder
+from semgaze.modeling.encoder import GazeEncoder
 from semgaze.modeling.decoder import GazeDecoder
 from semgaze.losses import (
     compute_heatmap_loss,
@@ -45,7 +44,7 @@ from semgaze.losses import (
     compute_info_nce_loss_batch_local,
     compute_alignment_loss,
 )
-from semgaze.metrics import Distance, GFTestAUC, GFTestDistance, MultiAccuracy, GazeAccuracy
+from semgaze.metrics import Distance, GFTestAUC, GFTestDistance, MultiAccuracy, GazeAccuracy, VATAUC
 from semgaze.utils.common import spatial_argmax2d, dark_coordinate_decoding
 
 TERM_COLOR = "cyan"
@@ -155,27 +154,42 @@ class SemGazeModule(pl.LightningModule):
         )
         self.image_encoder_lora_enabled = False
         self._apply_image_encoder_lora()
-        self.feature_map_size = cfg.model.semgaze.image_size // cfg.model.semgaze.patch_size
-        
         self.dataset = cfg.experiment.dataset
+        self.has_label_task = self.dataset in ("gazefollow", "gazehoi")
         if self.dataset == "gazefollow":
             self.num_train_samples = cfg.data.gf.num_train_samples
             self.vocab_size = cfg.data.gf.vocab_size
         elif self.dataset == "gazehoi":
             self.num_train_samples = cfg.data.gazehoi.num_train_samples
             self.vocab_size = cfg.data.gazehoi.vocab_size
+        elif self.dataset == "vat":
+            self.num_train_samples = int(_cfg_get(cfg, "data.vat.num_train_samples", 1))
+            self.vocab_size = max(1, int(_cfg_get(cfg, "data.vat.vocab_size", 1)))
         else:
             raise ValueError(f"Dataset {self.dataset} not supported.") 
             
         self.num_steps_in_epoch = math.ceil(self.num_train_samples / cfg.train.batch_size)
         
         # Define Metrics
-        self.metrics = nn.ModuleDict({
-            "val_dist": Distance(), 
-            "test_dist": GFTestDistance() if self.dataset == "gazefollow" else Distance(),
-            "test_acc@1": tm.Accuracy(task="multiclass", num_classes=self.vocab_size, top_k=1, ignore_index=-1),
-            "test_acc@3": tm.Accuracy(task="multiclass", num_classes=self.vocab_size, top_k=3, ignore_index=-1),
-        })
+        self.metrics = nn.ModuleDict(
+            {
+                "val_dist": Distance(),
+                "test_dist": GFTestDistance() if self.dataset == "gazefollow" else Distance(),
+            }
+        )
+        if self.has_label_task:
+            self.metrics["test_acc@1"] = tm.Accuracy(
+                task="multiclass",
+                num_classes=self.vocab_size,
+                top_k=1,
+                ignore_index=-1,
+            )
+            self.metrics["test_acc@3"] = tm.Accuracy(
+                task="multiclass",
+                num_classes=self.vocab_size,
+                top_k=3,
+                ignore_index=-1,
+            )
         
         if self.dataset == "gazefollow":
             self.metrics["test_multi_acc@1"] = MultiAccuracy(top_k=1, ignore_index=-1)
@@ -183,6 +197,8 @@ class SemGazeModule(pl.LightningModule):
         if self.dataset == "gazehoi":
             self.metrics["val_gaze_acc"] = GazeAccuracy()
             self.metrics["test_gaze_acc"] = GazeAccuracy()
+        if self.dataset == "vat":
+            self.metrics["test_auc"] = VATAUC()
 
         # Define logit scale parameter for loss computation
         self.logit_scale = nn.Parameter(torch.log(torch.tensor(1 / cfg.model.semgaze.temp_init_value)))
@@ -235,12 +251,9 @@ class SemGazeModule(pl.LightningModule):
             )
         ).lower()
         self.object_align_weight = float(_cfg_get(cfg, "loss.weight_align_object", 0.0))
-        self.heatmap_loss_fn = str(_cfg_get(cfg, "loss.heatmap_loss_fn", "mse")).lower()
-        if self.heatmap_loss_fn not in {"mse", "bce"}:
-            raise ValueError(
-                f"Expected `loss.heatmap_loss_fn` to be one of ['mse', 'bce'], got {self.heatmap_loss_fn}."
-            )
-        self.label_objective = str(_cfg_get(cfg, "loss.label_objective", "legacy_infonce")).lower()
+        self.label_objective = str(_cfg_get(cfg, "loss.label_objective", "infonce")).lower()
+        if self.label_objective == "legacy_infonce":
+            self.label_objective = "infonce"
         self.label_margin_type = str(_cfg_get(cfg, "loss.label_margin_type", "none")).lower()
         self.label_margin = float(_cfg_get(cfg, "loss.label_margin", 0.0))
         self.label_easy_margin = bool(_cfg_get(cfg, "loss.label_easy_margin", False))
@@ -467,12 +480,12 @@ class SemGazeModule(pl.LightningModule):
         return batch_flip
 
     def _forward_test(self, batch):
-        gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self(batch, return_alignment=False)
+        gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred, _, _ = self(batch, return_alignment=False)
         if not (self.test_tta_enabled and self.test_tta_hflip):
             return gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred
 
         batch_flip = self._build_hflip_batch(batch)
-        gaze_heatmap_pred_flip, _, _ = self(batch_flip, return_alignment=False)
+        gaze_heatmap_pred_flip, _, _, _, _ = self(batch_flip, return_alignment=False)
         gaze_heatmap_pred_flip = torch.flip(gaze_heatmap_pred_flip, dims=[-1])
         gaze_heatmap_pred = 0.5 * (gaze_heatmap_pred + gaze_heatmap_pred_flip)
         return gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred
@@ -501,24 +514,24 @@ class SemGazeModule(pl.LightningModule):
                 gaze_heatmap_pred,
                 gaze_heatmap_gt,
                 inout_gt,
-                loss_fn=self.heatmap_loss_fn,
             )
-            if self.label_objective in {"legacy_infonce", "batch_local_infonce"}:
-                label_loss = compute_info_nce_loss_batch_local(
-                    gaze_label_emb_pred, gaze_label_emb_gt, inout_gt, self.logit_scale
-                )
-            else:
-                self._ensure_vocab_embeddings()
-                label_loss = compute_info_nce_loss(
-                    emb_pred=gaze_label_emb_pred,
-                    label_id_gt=gaze_label_id_gt,
-                    io_gt=inout_gt,
-                    logit_scale=self.logit_scale,
-                    vocab_emb=self.vocab_emb,
-                    margin_type=self.label_margin_type,
-                    margin=self.label_margin,
-                    easy_margin=self.label_easy_margin,
-                )
+            if self.has_label_task:
+                if self.label_objective in {"infonce", "batch_local_infonce"}:
+                    label_loss = compute_info_nce_loss_batch_local(
+                        gaze_label_emb_pred, gaze_label_emb_gt, inout_gt, self.logit_scale
+                    )
+                else:
+                    self._ensure_vocab_embeddings()
+                    label_loss = compute_info_nce_loss(
+                        emb_pred=gaze_label_emb_pred,
+                        label_id_gt=gaze_label_id_gt,
+                        io_gt=inout_gt,
+                        logit_scale=self.logit_scale,
+                        vocab_emb=self.vocab_emb,
+                        margin_type=self.label_margin_type,
+                        margin=self.label_margin,
+                        easy_margin=self.label_easy_margin,
+                    )
             angular_loss = compute_angular_loss(gaze_vec_pred, gaze_vec_gt, inout_gt)
         
         total_loss = (
@@ -586,7 +599,7 @@ class SemGazeModule(pl.LightningModule):
             
                 
     def on_fit_start(self):
-        if self.label_objective not in {"legacy_infonce", "batch_local_infonce"}:
+        if self.has_label_task and self.label_objective not in {"infonce", "batch_local_infonce"}:
             self._ensure_vocab_embeddings()
         # Define metrics
         if self.cfg.wandb.log:
@@ -600,14 +613,20 @@ class SemGazeModule(pl.LightningModule):
                 wandb.define_metric('metric/val/gaze_acc', summary='max')
                 wandb.define_metric('metric/test/gaze_acc', summary='max')
                 wandb.define_metric('metric/test/dist', summary='min')
+            elif self.dataset == "vat":
+                wandb.define_metric('metric/test/dist', summary='min')
+                wandb.define_metric('metric/test/auc', summary='max')
             
             wandb.define_metric('loss/train_epoch', summary='min')
             wandb.define_metric('loss/val', summary='min')
             wandb.define_metric('metric/val/dist', summary='min')
-            wandb.define_metric('metric/test/acc@1', summary='max')
-            wandb.define_metric('metric/test/acc@3', summary='max')
+            if self.has_label_task:
+                wandb.define_metric('metric/test/acc@1', summary='max')
+                wandb.define_metric('metric/test/acc@3', summary='max')
 
     def _ensure_vocab_embeddings(self):
+        if not self.has_label_task:
+            return
         if self.vocab_emb.numel() > 0:
             return
         vocab2id_path = os.path.join(self.cfg.project.root, f"data/{self.dataset}/vocab2id.json")
@@ -722,38 +741,15 @@ class SemGazeModule(pl.LightningModule):
         )
         
         # Forward pass
-        if align_path_active and object_align_path_active:
-            gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred, align_feat_pred, object_align_feat_pred = self(
-                batch,
-                return_alignment=True,
-                return_object_alignment=True,
-            )
+        gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred, align_feat_pred, object_align_feat_pred = self(
+            batch,
+            return_alignment=align_path_active,
+            return_object_alignment=object_align_path_active,
+        )
+        if align_feat_pred is not None:
             align_feat_pred = self._select_target_person_token(align_feat_pred, batch)
+        if object_align_feat_pred is not None:
             object_align_feat_pred = self._select_target_person_token(object_align_feat_pred, batch)
-        elif align_path_active:
-            gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred, align_feat_pred = self(
-                batch,
-                return_alignment=True,
-                return_object_alignment=False,
-            )
-            align_feat_pred = self._select_target_person_token(align_feat_pred, batch)
-            object_align_feat_pred = None
-        elif object_align_path_active:
-            gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred, object_align_feat_pred = self(
-                batch,
-                return_alignment=False,
-                return_object_alignment=True,
-            )
-            align_feat_pred = None
-            object_align_feat_pred = self._select_target_person_token(object_align_feat_pred, batch)
-        else:
-            gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self(
-                batch,
-                return_alignment=False,
-                return_object_alignment=False,
-            )
-            align_feat_pred = None
-            object_align_feat_pred = None
         gaze_vec_pred = self._select_target_person_token(gaze_vec_pred, batch)
         gaze_heatmap_pred = self._select_target_person_token(gaze_heatmap_pred, batch)
         gaze_label_emb_pred = self._select_target_person_token(gaze_label_emb_pred, batch)
@@ -852,7 +848,7 @@ class SemGazeModule(pl.LightningModule):
         ni = int(batch["inout"].sum().item())
         
         # Forward pass
-        gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred = self(batch, return_alignment=False)
+        gaze_heatmap_pred, gaze_vec_pred, gaze_label_emb_pred, _, _ = self(batch, return_alignment=False)
         gaze_vec_pred = self._select_target_person_token(gaze_vec_pred, batch)
         gaze_heatmap_pred = self._select_target_person_token(gaze_heatmap_pred, batch)
         gaze_pt_pred = spatial_argmax2d(gaze_heatmap_pred, normalize=True)  # (b, 2)
@@ -887,7 +883,8 @@ class SemGazeModule(pl.LightningModule):
         
     
     def on_test_start(self):        
-        self._ensure_vocab_embeddings()
+        if self.has_label_task:
+            self._ensure_vocab_embeddings()
         
     
     def test_step(self, batch, batch_idx):
@@ -899,7 +896,9 @@ class SemGazeModule(pl.LightningModule):
         gaze_heatmap_pred, _, gaze_label_emb_pred = self._forward_test(batch)
         gaze_heatmap_pred = self._select_target_person_token(gaze_heatmap_pred, batch)
         gaze_label_emb_pred = self._select_target_person_token(gaze_label_emb_pred, batch)
-        gaze_label_logit_pred = gaze_label_emb_pred @ self.vocab_emb.T * self.logit_scale.exp() # (b, vocab_size)
+        gaze_label_logit_pred = None
+        if self.has_label_task:
+            gaze_label_logit_pred = gaze_label_emb_pred @ self.vocab_emb.T * self.logit_scale.exp()  # (b, vocab_size)
             
         # Logging dataset-specific metrics
         if self.dataset == "gazefollow":
@@ -933,13 +932,102 @@ class SemGazeModule(pl.LightningModule):
             
             self.log("metric/test/dist", self.metrics["test_dist"], batch_size=ni, prog_bar=True, on_step=False, on_epoch=True)
             self.log("metric/test/gaze_acc", self.metrics["test_gaze_acc"], batch_size=ni, prog_bar=True, on_step=False, on_epoch=True)
+        elif self.dataset == "vat":
+            if self.test_l2_eval_mode == "dark":
+                gaze_pt_pred = dark_coordinate_decoding(
+                    gaze_heatmap_pred,
+                    kernel_size=self.cfg.data.heatmap_sigma * 3,
+                    normalize=True,
+                )
+            else:
+                gaze_pt_pred = spatial_argmax2d(gaze_heatmap_pred, normalize=True)
+            self.metrics["test_dist"].update(gaze_pt_pred, batch["gaze_pt"], batch["inout"])
+            self.metrics["test_auc"].update(gaze_heatmap_pred, batch["gaze_pt"], batch["img_size"], batch["inout"])
+            self.log("metric/test/dist", self.metrics["test_dist"], batch_size=ni, prog_bar=True, on_step=False, on_epoch=True)
+            self.log("metric/test/auc", self.metrics["test_auc"], batch_size=ni, prog_bar=True, on_step=False, on_epoch=True)
         
         # Update and log common metrics
-        self.metrics["test_acc@1"].update(gaze_label_logit_pred, batch["gaze_label_id"])
-        self.metrics["test_acc@3"].update(gaze_label_logit_pred, batch["gaze_label_id"])
+        if self.has_label_task and (gaze_label_logit_pred is not None):
+            self.metrics["test_acc@1"].update(gaze_label_logit_pred, batch["gaze_label_id"])
+            self.metrics["test_acc@3"].update(gaze_label_logit_pred, batch["gaze_label_id"])
 
-        self.log("metric/test/acc@1", self.metrics["test_acc@1"], batch_size=n, prog_bar=False, on_step=False, on_epoch=True)
-        self.log("metric/test/acc@3", self.metrics["test_acc@3"], batch_size=n, prog_bar=False, on_step=False, on_epoch=True)
+            self.log("metric/test/acc@1", self.metrics["test_acc@1"], batch_size=n, prog_bar=False, on_step=False, on_epoch=True)
+            self.log("metric/test/acc@3", self.metrics["test_acc@3"], batch_size=n, prog_bar=False, on_step=False, on_epoch=True)
+
+    def on_test_epoch_end(self):
+        # Scalars logged via self.log() are rendered as time-series by default in W&B.
+        # Log an explicit bar chart at test epoch end for easier side-by-side comparison.
+        if not self.cfg.wandb.log:
+            return
+        if self.trainer is None or (not self.trainer.is_global_zero):
+            return
+
+        wb_run = None
+        if getattr(self, "logger", None) is not None and hasattr(self.logger, "experiment"):
+            wb_run = self.logger.experiment
+        if wb_run is None:
+            wb_run = wandb.run
+        if wb_run is None:
+            return
+
+        merged_metrics = {}
+        for metric_source in (
+            getattr(self.trainer, "callback_metrics", {}),
+            getattr(self.trainer, "logged_metrics", {}),
+            getattr(self.trainer, "progress_bar_metrics", {}),
+        ):
+            merged_metrics.update(metric_source)
+
+        if self.dataset == "gazefollow":
+            metric_keys = [
+                "metric/test/auc",
+                "metric/test/dist_to_avg",
+                "metric/test/avg_dist",
+                "metric/test/min_dist",
+                "metric/test/multi_acc@1",
+            ]
+            if self.has_label_task:
+                metric_keys.extend(["metric/test/acc@1", "metric/test/acc@3"])
+        elif self.dataset == "gazehoi":
+            metric_keys = [
+                "metric/test/dist",
+                "metric/test/gaze_acc",
+            ]
+            if self.has_label_task:
+                metric_keys.extend(["metric/test/acc@1", "metric/test/acc@3"])
+        else:
+            metric_keys = ["metric/test/dist", "metric/test/auc"]
+
+        rows = []
+        for key in metric_keys:
+            if key not in merged_metrics:
+                continue
+            value = merged_metrics[key]
+            if torch.is_tensor(value):
+                if value.numel() != 1:
+                    continue
+                value = float(value.detach().cpu().item())
+            else:
+                try:
+                    value = float(value)
+                except Exception:
+                    continue
+            rows.append([key, value])
+
+        if len(rows) == 0:
+            return
+
+        table = wandb.Table(data=rows, columns=["metric", "value"])
+        wb_run.log(
+            {
+                f"metric/test/bar_{self.dataset}": wandb.plot.bar(
+                    table,
+                    "metric",
+                    "value",
+                    title=f"Test Metrics ({self.dataset})",
+                )
+            }
+        )
  
 
 
@@ -995,22 +1083,27 @@ class SemGaze(nn.Module):
             num_heads=decoder_num_heads,
             label_emb_dim=decoder_label_emb_dim
         )
+        self.reasoning_alignment_head_type = str(reasoning_alignment_head_type).lower()
+        self.object_alignment_head_type = str(object_alignment_head_type).lower()
         self.alignment_head = self._build_alignment_head(
             token_dim=token_dim,
             output_dim=alignment_feature_dim,
-            head_type=reasoning_alignment_head_type,
+            head_type=self.reasoning_alignment_head_type,
         )
         self.object_alignment_head = self._build_alignment_head(
             token_dim=token_dim,
             output_dim=object_alignment_feature_dim,
-            head_type=object_alignment_head_type,
+            head_type=self.object_alignment_head_type,
         )
 
     @staticmethod
     def _build_alignment_head(token_dim: int, output_dim: int, head_type: str) -> nn.Module:
         head_type = str(head_type).lower()
         if head_type == "projection":
-            return nn.Linear(token_dim, output_dim)
+            return nn.Sequential(
+                nn.LayerNorm(token_dim),
+                nn.Linear(token_dim, output_dim),
+            )
         if head_type == "mlp":
             hidden_dim = (token_dim + output_dim) // 2
             return nn.Sequential(
@@ -1021,6 +1114,16 @@ class SemGaze(nn.Module):
                 nn.Linear(hidden_dim, output_dim),
             )
         raise ValueError(f"Unsupported alignment head_type: {head_type}. Use one of {{'projection', 'mlp'}}.")
+
+    @staticmethod
+    def _project_and_normalize(head: nn.Module, tokens: torch.Tensor | None, use_squared_l2_norm: bool):
+        if tokens is None:
+            return None
+        feat = head(tokens)
+        if use_squared_l2_norm:
+            norm_sq = feat.pow(2).sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            return feat / norm_sq
+        return F.normalize(feat, p=2, dim=-1)
 
 
     def forward(
@@ -1047,6 +1150,8 @@ class SemGaze(nn.Module):
         image_tokens = image_tokens.permute(0, 2, 1).view(b, d, s, s) # (b, d, t) >> (b, d, s, s)
         
         # Decode Gaze Target =====================================================
+        align_tokens = None
+        object_tokens = None
         if return_alignment and return_object_alignment:
             gaze_heatmap, gaze_label_emb, align_tokens, object_tokens = self.gaze_decoder(
                 image_tokens,
@@ -1055,33 +1160,31 @@ class SemGaze(nn.Module):
                 align_layer_index=align_layer_index,
                 return_object_tokens=True,
             )
-            align_feat = self.alignment_head(align_tokens)
-            align_feat = F.normalize(align_feat, p=2, dim=-1)
-            object_align_feat = self.object_alignment_head(object_tokens)
-            object_align_feat = F.normalize(object_align_feat, p=2, dim=-1)
-            return gaze_heatmap, gaze_vec, gaze_label_emb, align_feat, object_align_feat
-
-        if return_alignment:
+        elif return_alignment:
             gaze_heatmap, gaze_label_emb, align_tokens = self.gaze_decoder(
                 image_tokens,
                 gaze_tokens,
                 return_alignment_tokens=True,
                 align_layer_index=align_layer_index,
             )
-            align_feat = self.alignment_head(align_tokens)
-            align_feat = F.normalize(align_feat, p=2, dim=-1)
-            return gaze_heatmap, gaze_vec, gaze_label_emb, align_feat
-
-        if return_object_alignment:
+        elif return_object_alignment:
             gaze_heatmap, gaze_label_emb, object_tokens = self.gaze_decoder(
                 image_tokens,
                 gaze_tokens,
                 return_alignment_tokens=False,
                 return_object_tokens=True,
             )
-            object_align_feat = self.object_alignment_head(object_tokens)
-            object_align_feat = F.normalize(object_align_feat, p=2, dim=-1)
-            return gaze_heatmap, gaze_vec, gaze_label_emb, object_align_feat
+        else:
+            gaze_heatmap, gaze_label_emb = self.gaze_decoder(image_tokens, gaze_tokens)
 
-        gaze_heatmap, gaze_label_emb = self.gaze_decoder(image_tokens, gaze_tokens)  # (b, n, hm_h, hm_w), (b, n, 512)
-        return gaze_heatmap, gaze_vec, gaze_label_emb
+        align_feat = self._project_and_normalize(
+            self.alignment_head,
+            align_tokens,
+            use_squared_l2_norm=(self.reasoning_alignment_head_type == "projection"),
+        )
+        object_align_feat = self._project_and_normalize(
+            self.object_alignment_head,
+            object_tokens,
+            use_squared_l2_norm=(self.object_alignment_head_type == "projection"),
+        )
+        return gaze_heatmap, gaze_vec, gaze_label_emb, align_feat, object_align_feat

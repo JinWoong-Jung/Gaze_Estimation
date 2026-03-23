@@ -250,6 +250,12 @@ class RandomCropSafeGaze(object):
                 
                 sample["inout"] = 1. - sample["inout"]
                 sample["gaze_pt"] = torch.tensor([-1., -1.], dtype=torch.float)
+                for valid_key in ("gaze_align_valid", "object_align_valid", "image_align_valid"):
+                    if valid_key in sample:
+                        if torch.is_tensor(sample[valid_key]):
+                            sample[valid_key] = torch.zeros_like(sample[valid_key], dtype=torch.float32)
+                        else:
+                            sample[valid_key] = 0.0
                 if "reasoning_valid" in sample:
                     if torch.is_tensor(sample["reasoning_valid"]):
                         sample["reasoning_valid"] = torch.zeros_like(sample["reasoning_valid"], dtype=torch.float32)

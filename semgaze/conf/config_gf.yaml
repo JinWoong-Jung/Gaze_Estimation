@@ -20,16 +20,16 @@ project:
 # ------------------------------------------------------------------------------------------------------------------- #
 
 experiment:
-    name: SOTA(448->512), BCE # name of the wandb job
+    name: baseline (img_size=512, label_objective=infonce, token_dim=768) # name of the wandb job
     group: null # name of the wandb group
     task: train+test # combination of {train, val, test} separated by '+' sign
-    dataset: gazefollow # gazefollow, gazehoi
+    dataset: gazefollow # gazefollow, gazehoi, vat
 
 # ------------------------------------------------------------------------------------------------------------------- #
 
 data:
     num_people: 1 # int or -1 to include all people
-    image_size: 512
+    image_size: 512 # [256, 512]
     heatmap_size: 64 # 64
     heatmap_sigma: 3
     return_head_mask: False
@@ -40,10 +40,6 @@ data:
         object_feature_root: /home/elicer/semgaze/data/gazefollow_reason/features/object_only
         num_train_samples: 108955
         vocab_size: 346
-    gazehoi:
-        root: /home/elicer/semgaze/data/gazehoi # FILL ME
-        num_train_samples: 47044
-        vocab_size: 463
 
 
 # ------------------------------------------------------------------------------------------------------------------- #
@@ -57,13 +53,6 @@ model:
         image_encoder:
             name: facebook/dinov3-vitl16-pretrain-lvd1689m # facebook/dinov3-vitl16-pretrain-lvd1689m or facebook/dinov3-vitb16-pretrain-lvd1689m
             freeze: True
-            unfreeze_last_n_blocks: 0
-            lora:
-                enabled: False
-                r: 8
-                alpha: 16
-                dropout: 0.05
-                target_modules: [auto] # auto or explicit names
         image_to_decoder_proj:
             enabled: True # set False to bypass projection (requires image encoder hidden size == token_dim)
         decoder_depth: 2
@@ -77,33 +66,32 @@ model:
 
 loss:
     weight_heatmap: 100
-    heatmap_loss_fn: bce # mse | bce
     weight_angular: 3 # 3
     weight_label: 1 # 1
-    label_objective: global_vocab_ce # legacy_infonce | global_vocab_ce
+    label_objective: infonce # infonce | global_vocab_ce
     label_margin_type: none # none, cosface, arcface
     label_margin: 0.0
     label_easy_margin: False
-    weight_align_reasoning: 0.5 # reasoning-only alignment loss weight
-    weight_align_object: 0.5 # object-only alignment loss weight
+    weight_align_reasoning: 0 # 0.5
+    weight_align_object: 0 # 0.2
 
 # ------------------------------------------------------------------------------------------------------------------- #
 
 alignment_reasoning:
-    enabled: True
+    enabled: False
     train_only: True
-    head_type: mlp # mlp | projection
+    head_type: projection # mlp | projection
     feature_dim: 1024
-    layer_index: 1 # 1-based index in decoder transformer depth
+    layer_index: 1
     loss_type: infonce # cosine, mse, infonce
     head_lr_mult: 3.0
     temp_init_value: 0.07 # used when loss_type=infonce
     reasoning_log_limit: 20
 
 alignment_object:
-    enabled: True
+    enabled: False
     train_only: True
-    head_type: mlp # mlp | projection
+    head_type: projection # mlp | projection
     feature_dim: 1024
     loss_type: infonce # cosine, mse, infonce
     head_lr_mult: 3.0
@@ -162,7 +150,7 @@ test:
     l2_eval_mode: argmax # argmax (official-style), dark (optional)
     tta:
         enabled: False
-        hflip: True
+        hflip: False
 
 # ------------------------------------------------------------------------------------------------------------------- #
 

@@ -56,6 +56,15 @@ class GazeFollowDataset(Dataset):
         num_people: int = 1,
         head_thr: float = 0.5,
         return_head_mask: bool = False,
+        gaze_align_feature_root: Union[str, None] = None,
+        gaze_align_feature_preload: bool = False,
+        gaze_align_feature_dim: int = 768,
+        object_align_feature_root: Union[str, None] = None,
+        object_align_feature_preload: bool = False,
+        object_align_feature_dim: int = 768,
+        image_align_feature_root: Union[str, None] = None,
+        image_align_feature_preload: bool = False,
+        image_align_feature_dim: int = 768,
         reasoning_feature_root: Union[str, None] = None,
         reasoning_feature_preload: bool = False,
         reasoning_feature_dim: int = 768,
@@ -81,15 +90,36 @@ class GazeFollowDataset(Dataset):
         self.num_people = num_people
         self.head_thr = head_thr
         self.return_head_mask = return_head_mask
-        self.reasoning_feature_root = reasoning_feature_root
-        self.reasoning_feature_preload = reasoning_feature_preload
-        self.reasoning_feature_dim = reasoning_feature_dim
-        self.object_feature_root = object_feature_root
-        self.object_feature_preload = object_feature_preload
-        self.object_feature_dim = object_feature_dim
+        # New per-path feature roots (with backward-compatible fallbacks).
+        self.gaze_align_feature_root = (
+            gaze_align_feature_root if gaze_align_feature_root is not None else reasoning_feature_root
+        )
+        self.gaze_align_feature_preload = bool(gaze_align_feature_preload or reasoning_feature_preload)
+        self.gaze_align_feature_dim = int(gaze_align_feature_dim if gaze_align_feature_dim is not None else reasoning_feature_dim)
+
+        self.object_align_feature_root = (
+            object_align_feature_root if object_align_feature_root is not None else object_feature_root
+        )
+        self.object_align_feature_preload = bool(object_align_feature_preload or object_feature_preload)
+        self.object_align_feature_dim = int(
+            object_align_feature_dim if object_align_feature_dim is not None else object_feature_dim
+        )
+
+        self.image_align_feature_root = image_align_feature_root
+        self.image_align_feature_preload = bool(image_align_feature_preload)
+        self.image_align_feature_dim = int(image_align_feature_dim)
+
+        # Backward-compatible aliases used by existing code paths.
+        self.reasoning_feature_root = self.gaze_align_feature_root
+        self.reasoning_feature_preload = self.gaze_align_feature_preload
+        self.reasoning_feature_dim = self.gaze_align_feature_dim
+        self.object_feature_root = self.object_align_feature_root
+        self.object_feature_preload = self.object_align_feature_preload
+        self.object_feature_dim = self.object_align_feature_dim
         self.reasoning_log_limit = reasoning_log_limit
         self.reasoning_warn_count = 0
         self.object_warn_count = 0
+        self.image_warn_count = 0
         self.label_emb_cache = {}
         self.test_groups = None
         self.test_group_keys = []
@@ -99,19 +129,26 @@ class GazeFollowDataset(Dataset):
         self.reasoning_feature_h5_path = None
         self.reasoning_feature_h5 = None
         self.reasoning_feature_index = None
-        if (self.split == "train") and (self.reasoning_feature_root is not None):
-            self.reasoning_feature_h5_path = os.path.join(self.reasoning_feature_root, f"{self.split}.h5")
+        if (self.split == "train") and (self.gaze_align_feature_root is not None):
+            self.reasoning_feature_h5_path = os.path.join(self.gaze_align_feature_root, f"{self.split}.h5")
         self.object_feature_h5_path = None
         self.object_feature_h5 = None
         self.object_feature_index = None
-        if (self.split == "train") and (self.object_feature_root is not None):
-            self.object_feature_h5_path = os.path.join(self.object_feature_root, f"{self.split}.h5")
+        if (self.split == "train") and (self.object_align_feature_root is not None):
+            self.object_feature_h5_path = os.path.join(self.object_align_feature_root, f"{self.split}.h5")
+        self.image_feature_h5_path = None
+        self.image_feature_h5 = None
+        self.image_feature_index = None
+        if (self.split == "train") and (self.image_align_feature_root is not None):
+            self.image_feature_h5_path = os.path.join(self.image_align_feature_root, f"{self.split}.h5")
 
         # Optional eager preload: open h5 + build key->row index once at startup.
-        if self.reasoning_feature_preload and (self.reasoning_feature_h5_path is not None):
+        if self.gaze_align_feature_preload and (self.reasoning_feature_h5_path is not None):
             self.reasoning_feature_index = self._build_reasoning_feature_index()
-        if self.object_feature_preload and (self.object_feature_h5_path is not None):
+        if self.object_align_feature_preload and (self.object_feature_h5_path is not None):
             self.object_feature_index = self._build_object_feature_index()
+        if self.image_align_feature_preload and (self.image_feature_h5_path is not None):
+            self.image_feature_index = self._build_image_feature_index()
 
     def _warn_reasoning(self, msg: str):
         if self.reasoning_warn_count < self.reasoning_log_limit:
@@ -126,6 +163,13 @@ class GazeFollowDataset(Dataset):
             self.object_warn_count += 1
             if self.object_warn_count == self.reasoning_log_limit:
                 print("[GazeFollowDataset][object] warning log limit reached; suppressing further messages.")
+
+    def _warn_image(self, msg: str):
+        if self.image_warn_count < self.reasoning_log_limit:
+            print(f"[GazeFollowDataset][image] {msg}")
+            self.image_warn_count += 1
+            if self.image_warn_count == self.reasoning_log_limit:
+                print("[GazeFollowDataset][image] warning log limit reached; suppressing further messages.")
 
     def _get_reasoning_feature_key(self, image_path: str, sample_id: Union[int, str]) -> str:
         rel_dir = os.path.dirname(image_path)  # e.g. train/00000000
@@ -254,6 +298,62 @@ class GazeFollowDataset(Dataset):
             return emb
         except Exception as exc:
             self._warn_object(f"failed loading h5 feature: key={object_key} ({exc})")
+            return None
+
+    def _ensure_image_feature_h5(self):
+        if self.image_feature_h5 is not None:
+            return True
+        if self.image_feature_h5_path is None:
+            return False
+        if not os.path.exists(self.image_feature_h5_path):
+            self._warn_image(f"missing h5 feature file: {self.image_feature_h5_path}")
+            return False
+        try:
+            self.image_feature_h5 = h5py.File(self.image_feature_h5_path, "r")
+            return True
+        except Exception as exc:
+            self._warn_image(f"failed opening h5 feature file: {self.image_feature_h5_path} ({exc})")
+            self.image_feature_h5 = None
+            return False
+
+    def _build_image_feature_index(self):
+        if not self._ensure_image_feature_h5():
+            return {}
+        start_time = time.time()
+        index = {}
+        keys_ds = self.image_feature_h5.get("keys")
+        if keys_ds is None:
+            self._warn_image(f"missing dataset `keys` in h5: {self.image_feature_h5_path}")
+            return index
+        for i, key in enumerate(keys_ds):
+            if isinstance(key, bytes):
+                key = key.decode("utf-8")
+            index[str(key)] = i
+        elapsed = time.time() - start_time
+        print(
+            f"[GazeFollowDataset][image] preload index complete: "
+            f"entries={len(index)}, elapsed={elapsed:.1f}s"
+        )
+        return index
+
+    def _load_image_feature_from_h5(self, image_key: str):
+        if not self._ensure_image_feature_h5():
+            return None
+        if self.image_feature_index is None:
+            self.image_feature_index = self._build_image_feature_index()
+        emb_ds = self.image_feature_h5.get("embeddings")
+        if emb_ds is None:
+            self._warn_image(f"missing dataset `embeddings` in h5: {self.image_feature_h5_path}")
+            return None
+        row_idx = self.image_feature_index.get(image_key)
+        if row_idx is None:
+            return None
+        try:
+            emb = torch.from_numpy(emb_ds[row_idx]).to(torch.float32)
+            emb = F.normalize(emb, p=2, dim=-1)
+            return emb
+        except Exception as exc:
+            self._warn_image(f"failed loading h5 feature: key={image_key} ({exc})")
             return None
 
     def load_annotations(self) -> pd.DataFrame:
@@ -414,27 +514,38 @@ class GazeFollowDataset(Dataset):
         else:
             gaze_label_emb = self._get_label_embedding(gaze_label)
 
-        reasoning_emb = torch.zeros(self.reasoning_feature_dim, dtype=torch.float32)
-        reasoning_valid = torch.tensor(0.0, dtype=torch.float32)
-        if (self.split == "train") and (self.reasoning_feature_root is not None):
+        gaze_align_emb = torch.zeros(self.gaze_align_feature_dim, dtype=torch.float32)
+        gaze_align_valid = torch.tensor(0.0, dtype=torch.float32)
+        if (self.split == "train") and (self.gaze_align_feature_root is not None):
             reasoning_key = self._get_reasoning_feature_key(path, idx)
             loaded_reasoning_emb = self._load_reasoning_feature_from_h5(reasoning_key)
             if loaded_reasoning_emb is not None:
-                reasoning_emb = loaded_reasoning_emb
-                reasoning_valid = torch.tensor(1.0, dtype=torch.float32)
+                gaze_align_emb = loaded_reasoning_emb
+                gaze_align_valid = torch.tensor(1.0, dtype=torch.float32)
             else:
                 self._warn_reasoning(f"missing h5 feature key: {reasoning_key}")
 
-        object_emb = torch.zeros(self.object_feature_dim, dtype=torch.float32)
-        object_valid = torch.tensor(0.0, dtype=torch.float32)
-        if (self.split == "train") and (self.object_feature_root is not None):
+        object_align_emb = torch.zeros(self.object_align_feature_dim, dtype=torch.float32)
+        object_align_valid = torch.tensor(0.0, dtype=torch.float32)
+        if (self.split == "train") and (self.object_align_feature_root is not None):
             object_key = self._get_reasoning_feature_key(path, idx)
             loaded_object_emb = self._load_object_feature_from_h5(object_key)
             if loaded_object_emb is not None:
-                object_emb = loaded_object_emb
-                object_valid = torch.tensor(1.0, dtype=torch.float32)
+                object_align_emb = loaded_object_emb
+                object_align_valid = torch.tensor(1.0, dtype=torch.float32)
             else:
                 self._warn_object(f"missing h5 feature key: {object_key}")
+
+        image_align_emb = torch.zeros(self.image_align_feature_dim, dtype=torch.float32)
+        image_align_valid = torch.tensor(0.0, dtype=torch.float32)
+        if (self.split == "train") and (self.image_align_feature_root is not None):
+            image_key = self._get_reasoning_feature_key(path, idx)
+            loaded_image_emb = self._load_image_feature_from_h5(image_key)
+            if loaded_image_emb is not None:
+                image_align_emb = loaded_image_emb
+                image_align_valid = torch.tensor(1.0, dtype=torch.float32)
+            else:
+                self._warn_image(f"missing h5 feature key: {image_key}")
 
         sample = {
             "image": image,
@@ -447,10 +558,17 @@ class GazeFollowDataset(Dataset):
             "gaze_label_ids": gaze_label_ids,
             "gaze_label_emb": gaze_label_emb,
             "inout": inout,
-            "reasoning_emb": reasoning_emb,
-            "reasoning_valid": reasoning_valid,
-            "object_emb": object_emb,
-            "object_valid": object_valid,
+            "gaze_align_emb": gaze_align_emb,
+            "gaze_align_valid": gaze_align_valid,
+            "object_align_emb": object_align_emb,
+            "object_align_valid": object_align_valid,
+            "image_align_emb": image_align_emb,
+            "image_align_valid": image_align_valid,
+            # Backward-compatible aliases
+            "reasoning_emb": gaze_align_emb,
+            "reasoning_valid": gaze_align_valid,
+            "object_emb": object_align_emb,
+            "object_valid": object_align_valid,
             "id": idx,
             "img_size": torch.tensor((img_w, img_h), dtype=torch.long),
             "path": path,
@@ -522,6 +640,15 @@ class GazeFollowDataModule(pl.LightningDataModule):
         heatmap_size: Union[int, tuple[int, int]] = 64,
         num_people: dict = {"train": 1, "val": 1, "test": 1},
         return_head_mask: bool = False,
+        gaze_align_feature_root: Union[str, None] = None,
+        gaze_align_feature_preload: bool = False,
+        gaze_align_feature_dim: int = 768,
+        object_align_feature_root: Union[str, None] = None,
+        object_align_feature_preload: bool = False,
+        object_align_feature_dim: int = 768,
+        image_align_feature_root: Union[str, None] = None,
+        image_align_feature_preload: bool = False,
+        image_align_feature_dim: int = 768,
         reasoning_feature_root: Union[str, None] = None,
         reasoning_feature_preload: bool = False,
         reasoning_feature_dim: int = 768,
@@ -540,12 +667,28 @@ class GazeFollowDataModule(pl.LightningDataModule):
         self.num_people = {stage: num_people for stage in ["train", "val", "test"]} if isinstance(num_people, int) else num_people
         self.batch_size = {stage: batch_size for stage in ["train", "val", "test"]} if isinstance(batch_size, int) else batch_size
         self.return_head_mask = return_head_mask
-        self.reasoning_feature_root = reasoning_feature_root
-        self.reasoning_feature_preload = reasoning_feature_preload
-        self.reasoning_feature_dim = reasoning_feature_dim
-        self.object_feature_root = object_feature_root
-        self.object_feature_preload = object_feature_preload
-        self.object_feature_dim = object_feature_dim
+        self.gaze_align_feature_root = (
+            gaze_align_feature_root if gaze_align_feature_root is not None else reasoning_feature_root
+        )
+        self.gaze_align_feature_preload = bool(gaze_align_feature_preload or reasoning_feature_preload)
+        self.gaze_align_feature_dim = int(gaze_align_feature_dim if gaze_align_feature_dim is not None else reasoning_feature_dim)
+        self.object_align_feature_root = (
+            object_align_feature_root if object_align_feature_root is not None else object_feature_root
+        )
+        self.object_align_feature_preload = bool(object_align_feature_preload or object_feature_preload)
+        self.object_align_feature_dim = int(
+            object_align_feature_dim if object_align_feature_dim is not None else object_feature_dim
+        )
+        self.image_align_feature_root = image_align_feature_root
+        self.image_align_feature_preload = bool(image_align_feature_preload)
+        self.image_align_feature_dim = int(image_align_feature_dim)
+        # Backward-compatible aliases.
+        self.reasoning_feature_root = self.gaze_align_feature_root
+        self.reasoning_feature_preload = self.gaze_align_feature_preload
+        self.reasoning_feature_dim = self.gaze_align_feature_dim
+        self.object_feature_root = self.object_align_feature_root
+        self.object_feature_preload = self.object_align_feature_preload
+        self.object_feature_dim = self.object_align_feature_dim
         self.reasoning_log_limit = reasoning_log_limit
         
     def setup(self, stage: str):
@@ -578,6 +721,15 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 heatmap_sigma=self.heatmap_sigma,
                 num_people=self.num_people['train'],
                 return_head_mask=self.return_head_mask,
+                gaze_align_feature_root=self.gaze_align_feature_root,
+                gaze_align_feature_preload=self.gaze_align_feature_preload,
+                gaze_align_feature_dim=self.gaze_align_feature_dim,
+                object_align_feature_root=self.object_align_feature_root,
+                object_align_feature_preload=self.object_align_feature_preload,
+                object_align_feature_dim=self.object_align_feature_dim,
+                image_align_feature_root=self.image_align_feature_root,
+                image_align_feature_preload=self.image_align_feature_preload,
+                image_align_feature_dim=self.image_align_feature_dim,
                 reasoning_feature_root=self.reasoning_feature_root,
                 reasoning_feature_preload=self.reasoning_feature_preload,
                 reasoning_feature_dim=self.reasoning_feature_dim,
@@ -605,6 +757,15 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 heatmap_sigma=self.heatmap_sigma,
                 num_people=self.num_people['val'],
                 return_head_mask=self.return_head_mask,
+                gaze_align_feature_root=None,
+                gaze_align_feature_preload=False,
+                gaze_align_feature_dim=self.gaze_align_feature_dim,
+                object_align_feature_root=None,
+                object_align_feature_preload=False,
+                object_align_feature_dim=self.object_align_feature_dim,
+                image_align_feature_root=None,
+                image_align_feature_preload=False,
+                image_align_feature_dim=self.image_align_feature_dim,
                 reasoning_feature_root=None,
                 reasoning_feature_preload=False,
                 reasoning_feature_dim=self.reasoning_feature_dim,
@@ -633,6 +794,15 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 heatmap_sigma=self.heatmap_sigma,
                 num_people=self.num_people['val'],
                 return_head_mask=self.return_head_mask,
+                gaze_align_feature_root=None,
+                gaze_align_feature_preload=False,
+                gaze_align_feature_dim=self.gaze_align_feature_dim,
+                object_align_feature_root=None,
+                object_align_feature_preload=False,
+                object_align_feature_dim=self.object_align_feature_dim,
+                image_align_feature_root=None,
+                image_align_feature_preload=False,
+                image_align_feature_dim=self.image_align_feature_dim,
                 reasoning_feature_root=None,
                 reasoning_feature_preload=False,
                 reasoning_feature_dim=self.reasoning_feature_dim,
@@ -661,6 +831,15 @@ class GazeFollowDataModule(pl.LightningDataModule):
                 heatmap_sigma=self.heatmap_sigma,
                 num_people=self.num_people['test'],
                 return_head_mask=self.return_head_mask,
+                gaze_align_feature_root=None,
+                gaze_align_feature_preload=False,
+                gaze_align_feature_dim=self.gaze_align_feature_dim,
+                object_align_feature_root=None,
+                object_align_feature_preload=False,
+                object_align_feature_dim=self.object_align_feature_dim,
+                image_align_feature_root=None,
+                image_align_feature_preload=False,
+                image_align_feature_dim=self.image_align_feature_dim,
                 reasoning_feature_root=None,
                 reasoning_feature_preload=False,
                 reasoning_feature_dim=self.reasoning_feature_dim,

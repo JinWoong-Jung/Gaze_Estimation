@@ -128,6 +128,7 @@ class GazeDecoder(nn.Module):
         # Resize heatmap to match ground truth if needed
         if gaze_heatmap.shape[-2:] != (64, 64):
             gaze_heatmap = F.interpolate(gaze_heatmap, size=(64, 64), mode='bilinear', align_corners=False)
+        gaze_heatmap = torch.sigmoid(gaze_heatmap)
 
         # Predict gaze label
         gaze_label_emb, label_hidden = self.label_mlp.forward_with_penultimate(gaze_tokens) # (b*n, 512), (b*n, c)

@@ -24,6 +24,7 @@ from pytorch_lightning.loggers.wandb import WandbLogger
 from semgaze.modeling.semgaze import SemGazeModule
 from semgaze.datasets.gazehoi import GazeHOIDataModule
 from semgaze.datasets.gazefollow import GazeFollowDataModule
+from semgaze.datasets.vat import VATDataModule
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -100,6 +101,7 @@ class Experiment(BaseExperiment):
                     "task": self.cfg.experiment.task,
                     "dataset": self.cfg.experiment.dataset,
                 },
+                "data": omegaconf.OmegaConf.to_container(self.cfg.data, resolve=True),
                 "project": {
                     "root": self.cfg.project.root,
                 },
@@ -199,8 +201,25 @@ class Experiment(BaseExperiment):
                 num_people=self.cfg.data.num_people,
                 return_head_mask=self.cfg.data.return_head_mask,
             )
+        elif self.cfg.experiment.dataset == "vat":
+            data = VATDataModule(
+                root=self.cfg.data.vat.root,
+                root_project=self.cfg.project.root,
+                batch_size={
+                    "train": self.cfg.train.batch_size,
+                    "val": self.cfg.val.batch_size,
+                    "test": self.cfg.test.batch_size,
+                },
+                image_size=self.cfg.data.image_size,
+                heatmap_size=self.cfg.data.heatmap_size,
+                heatmap_sigma=self.cfg.data.heatmap_sigma,
+                num_people=self.cfg.data.num_people,
+                return_head_mask=self.cfg.data.return_head_mask,
+            )
         else:
-            raise ValueError(f"Expected dataset to be one of [gazefollow, gazehoi]. Got {self.cfg.experiment.dataset}.")
+            raise ValueError(
+                f"Expected dataset to be one of [gazefollow, gazehoi, vat]. Got {self.cfg.experiment.dataset}."
+            )
         print(colored(f"Using the {self.cfg.experiment.dataset.upper()} dataset.", TERM_COLOR))
         return data
     

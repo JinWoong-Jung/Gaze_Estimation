@@ -87,13 +87,17 @@ def compute_dist_loss(gp_pred, gp_gt, io_gt):
     return dist_loss
 
 
-def compute_heatmap_loss(hm_pred, hm_gt, io_gt, loss_fn="mse"):
-    if loss_fn == "mse":
-        heatmap_loss = F.mse_loss(hm_pred, hm_gt, reduction="none").mean([1, 2])
-    elif loss_fn == "bce":
-        heatmap_loss = F.binary_cross_entropy_with_logits(hm_pred, hm_gt, reduction="none").mean([1, 2])
+def compute_heatmap_loss(hm_pred, hm_gt, io_gt):
+    # BCELoss is not autocast-safe in mixed precision. Compute it in fp32 with autocast disabled.
+    if torch.is_autocast_enabled():
+        with torch.autocast(device_type=hm_pred.device.type, enabled=False):
+            heatmap_loss = F.binary_cross_entropy(
+                hm_pred.float(),
+                hm_gt.float(),
+                reduction="none",
+            ).mean([1, 2])
     else:
-        raise Exception("loss_fn should be either 'mse' or 'bce'.")
+        heatmap_loss = F.binary_cross_entropy(hm_pred, hm_gt, reduction="none").mean([1, 2])
     heatmap_loss = torch.mul(heatmap_loss, io_gt)
     heatmap_loss = torch.sum(heatmap_loss) / torch.sum(io_gt)
     return heatmap_loss
@@ -143,3 +147,41 @@ def compute_alignment_loss(
         return 0.5 * (loss_i + loss_t)
 
     raise ValueError(f"Unsupported alignment loss type: {loss_type}")
+
+
+def compute_relational_distillation_loss(
+    emb_pred,
+    emb_gt,
+    valid_mask,
+    tau_student: float = 0.07,
+    tau_teacher: float = 0.07,
+    detach_teacher: bool = True,
+    remove_diagonal: bool = True,
+    min_valid: int = 2,
+):
+    mask = valid_mask.bool()
+    num_valid = int(torch.sum(mask).item())
+    min_valid = max(2, int(min_valid))
+    if num_valid < min_valid:
+        return torch.tensor(0.0, device=emb_pred.device, dtype=emb_pred.dtype)
+
+    student = F.normalize(emb_pred[mask], p=2, dim=-1)
+    teacher = F.normalize(emb_gt[mask], p=2, dim=-1)
+
+    if detach_teacher:
+        teacher = teacher.detach()
+
+    tau_student = max(float(tau_student), 1e-6)
+    tau_teacher = max(float(tau_teacher), 1e-6)
+
+    sim_student = (student @ student.t()) / tau_student
+    sim_teacher = (teacher @ teacher.t()) / tau_teacher
+
+    if remove_diagonal:
+        diag_mask = torch.eye(num_valid, device=sim_student.device, dtype=torch.bool)
+        sim_student = sim_student.masked_fill(diag_mask, -1e4)
+        sim_teacher = sim_teacher.masked_fill(diag_mask, -1e4)
+
+    teacher_prob = F.softmax(sim_teacher, dim=-1)
+    student_log_prob = F.log_softmax(sim_student, dim=-1)
+    return F.kl_div(student_log_prob, teacher_prob, reduction="batchmean")
